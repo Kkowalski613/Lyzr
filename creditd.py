@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -131,6 +132,15 @@ def load_roles_mapping(uploaded_roles) -> pd.DataFrame:
         return pd.DataFrame()
 
     roles_df = roles_df.rename(columns={c: c.strip().lower() for c in roles_df.columns})
+
+    # Normalize common alternate headers
+    alias_map = {
+        "column1": "email",          # sample workbook
+        "broader role": "role",
+        "broader_role": "role",
+    }
+    roles_df = roles_df.rename(columns=lambda c: alias_map.get(c, c))
+
     if "email" not in roles_df.columns:
         st.warning("Prophet roles workbook is missing an 'email' column; skipping enrichment.")
         return pd.DataFrame()
@@ -244,6 +254,29 @@ def agent_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def enrich_with_roles(df: pd.DataFrame, roles_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attach role/discipline/office to the usage frame for grouping and charts.
+    """
+    if df.empty:
+        return df.copy()
+
+    result = df.copy()
+    if roles_df is None or roles_df.empty:
+        for col in ("role", "discipline", "office"):
+            if col not in result.columns:
+                result[col] = ""
+        return result
+
+    lookup = roles_df.drop_duplicates("email").set_index("email")
+    result["email_lower"] = result["email"].astype(str).str.lower()
+    result["role"] = result["email_lower"].map(lookup["role"]).fillna("")
+    result["discipline"] = result["email_lower"].map(lookup["discipline"]).fillna("")
+    result["office"] = result["email_lower"].map(lookup["office"]).fillna("")
+    result = result.drop(columns=["email_lower"])
+    return result
+
+
 def style_user_dataframe(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
     """
     Highlight users exceeding the monthly allotment in red for quick scanning.
@@ -349,14 +382,42 @@ roles_available = show_roles and not roles_df.empty
 if show_roles and roles_df.empty:
     st.info("Prophet roles.xlsx not provided or unreadable. Role enrichment is skipped.")
 
-# Monthly consumption pattern (for projections)
-monthly_totals = clean_df.groupby("month_key")["credits"].sum()
+# Monthly consumption pattern (for projections & charts)
+monthly_base = clean_df.copy()
+if not include_embeddings:
+    monthly_base = monthly_base[monthly_base["call_type"] != "aembedding"].copy()
+
+monthly_totals = monthly_base.groupby("month_key")["credits"].sum()
 observed_months = len(monthly_totals)
 avg_monthly_usage = monthly_totals.mean() if observed_months > 0 else np.nan
 projected_annual_usage = avg_monthly_usage * 12 if observed_months > 0 else np.nan
 estimated_remaining = (
     TOTAL_ANNUAL_CREDITS - projected_annual_usage if pd.notna(projected_annual_usage) else np.nan
 )
+
+# Monthly activity frame for charts
+monthly_usage_df = (
+    monthly_base.groupby("month_key")
+    .agg(
+        total_credits=("credits", "sum"),
+        total_calls=("credits", "size"),
+        active_users=("email", lambda s: s[s != "(no email)"].nunique()),
+    )
+    .reset_index()
+    .sort_values("month_key")
+)
+monthly_usage_df["avg_calls_per_user"] = monthly_usage_df.apply(
+    lambda row: row["total_calls"] / row["active_users"] if row["active_users"] > 0 else np.nan,
+    axis=1,
+)
+monthly_usage_df["avg_credits_per_user"] = monthly_usage_df.apply(
+    lambda row: row["total_credits"] / row["active_users"] if row["active_users"] > 0 else np.nan,
+    axis=1,
+)
+monthly_usage_df["month_label"] = monthly_usage_df["month_key"].apply(
+    lambda m: pd.Period(m).to_timestamp().strftime("%b %Y")
+)
+monthly_usage_df["cumulative_credits"] = monthly_usage_df["total_credits"].cumsum()
 
 # Month choices
 available_months = sorted(clean_df["month_key"].dropna().unique())
@@ -380,6 +441,7 @@ else:
     visible_df = month_slice[month_slice["call_type"] != "aembedding"].copy()
 
 burst_users = detect_burst_users(visible_df, threshold=BURST_THRESHOLD)
+visible_enriched_df = enrich_with_roles(visible_df, roles_df)
 
 # Embedding share is *always* computed on the full month
 embeddings_df = month_slice[month_slice["call_type"] == "aembedding"]
@@ -536,6 +598,155 @@ with agent_col:
             agent_df,
             use_container_width=True,
             hide_index=True,
+        )
+
+# ---------- Charts & visualizations ----------
+
+st.markdown("---")
+st.subheader("Visualizations")
+
+tab_org, tab_activity, tab_allotment = st.tabs(["Org Usage", "User Activity", "Credit Allotment"])
+
+with tab_org:
+    st.caption("Credit consumption by office, discipline, and role (requires roles data).")
+
+    if visible_enriched_df.empty:
+        st.info("No data to display.")
+    elif roles_df.empty:
+        st.info("Upload Prophet roles.xlsx to view office/discipline/role charts.")
+    else:
+        def render_org_bar(data: pd.DataFrame, category: str, title: str):
+            if data.empty:
+                st.info(f"No {category} data to display.")
+                return
+            chart = (
+                alt.Chart(data)
+                .mark_bar()
+                .encode(
+                    y=alt.Y(f"{category}:N", sort="-x", title=category.title()),
+                    x=alt.X("Credits:Q", title="Credits"),
+                    tooltip=[
+                        alt.Tooltip(f"{category}:N", title=category.title()),
+                        alt.Tooltip("Credits:Q", format=","),
+                        alt.Tooltip("Calls:Q", format=","),
+                    ],
+                )
+                .properties(title=title, height=220)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+        office_df = (
+            visible_enriched_df[visible_enriched_df["office"] != ""]
+            .groupby("office")
+            .agg(Credits=("credits", "sum"), Calls=("credits", "size"))
+            .reset_index()
+            .rename(columns={"office": "Office"})
+            .sort_values("Credits", ascending=False)
+        )
+        discipline_df = (
+            visible_enriched_df[visible_enriched_df["discipline"] != ""]
+            .groupby("discipline")
+            .agg(Credits=("credits", "sum"), Calls=("credits", "size"))
+            .reset_index()
+            .rename(columns={"discipline": "Discipline"})
+            .sort_values("Credits", ascending=False)
+        )
+        role_df = (
+            visible_enriched_df[visible_enriched_df["role"] != ""]
+            .groupby("role")
+            .agg(Credits=("credits", "sum"), Calls=("credits", "size"))
+            .reset_index()
+            .rename(columns={"role": "Role"})
+            .sort_values("Credits", ascending=False)
+        )
+
+        org_col1, org_col2 = st.columns(2)
+        with org_col1:
+            render_org_bar(office_df, "Office", "Credits by Office")
+        with org_col2:
+            render_org_bar(discipline_df, "Discipline", "Credits by Discipline")
+        render_org_bar(role_df, "Role", "Credits by Role")
+
+with tab_activity:
+    st.caption("Average user activity month over month (filters applied).")
+    if monthly_usage_df.empty:
+        st.info("No monthly data to display.")
+    else:
+        activity_long = monthly_usage_df.melt(
+            id_vars=["month_key", "month_label"],
+            value_vars=["avg_calls_per_user", "avg_credits_per_user"],
+            var_name="Metric",
+            value_name="Value",
+        )
+        metric_labels = {
+            "avg_calls_per_user": "Avg calls per user",
+            "avg_credits_per_user": "Avg credits per user",
+        }
+        activity_long["Metric"] = activity_long["Metric"].map(metric_labels)
+
+        activity_chart = (
+            alt.Chart(activity_long)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("month_label:N", sort=monthly_usage_df["month_label"].tolist(), title="Month"),
+                y=alt.Y("Value:Q", title="Average"),
+                color=alt.Color("Metric:N", title="Metric"),
+                tooltip=[
+                    alt.Tooltip("month_label:N", title="Month"),
+                    alt.Tooltip("Metric:N"),
+                    alt.Tooltip("Value:Q", format=".2f"),
+                ],
+            )
+            .properties(height=300, title="Average user activity")
+        )
+        st.altair_chart(activity_chart, use_container_width=True)
+
+with tab_allotment:
+    st.caption("Credits consumed vs monthly and annual allotments.")
+    if monthly_usage_df.empty:
+        st.info("No monthly data to display.")
+    else:
+        month_sort = monthly_usage_df["month_label"].tolist()
+        monthly_bar = (
+            alt.Chart(monthly_usage_df)
+            .mark_bar(color="#2563eb")
+            .encode(
+                x=alt.X("month_label:N", sort=month_sort, title="Month"),
+                y=alt.Y("total_credits:Q", title="Monthly Credits"),
+                tooltip=[
+                    alt.Tooltip("month_label:N", title="Month"),
+                    alt.Tooltip("total_credits:Q", format=",", title="Credits"),
+                ],
+            )
+        )
+        monthly_rule = alt.Chart(pd.DataFrame({"limit": [MONTHLY_CREDIT_LIMIT]})).mark_rule(
+            color="red", strokeDash=[6, 3]
+        ).encode(y="limit:Q")
+        st.altair_chart(
+            (monthly_bar + monthly_rule).properties(title="Monthly credits vs 12,000 limit", height=320),
+            use_container_width=True,
+        )
+
+        cumulative_line = (
+            alt.Chart(monthly_usage_df)
+            .mark_line(point=True, color="#10b981")
+            .encode(
+                x=alt.X("month_label:N", sort=month_sort, title="Month"),
+                y=alt.Y("cumulative_credits:Q", title="Cumulative Credits"),
+                tooltip=[
+                    alt.Tooltip("month_label:N", title="Month"),
+                    alt.Tooltip("cumulative_credits:Q", format=",", title="Cumulative credits"),
+                ],
+            )
+        )
+        annual_rule = alt.Chart(pd.DataFrame({"limit": [TOTAL_ANNUAL_CREDITS]})).mark_rule(
+            color="orange", strokeDash=[6, 3]
+        ).encode(y="limit:Q")
+        st.altair_chart(
+            (cumulative_line + annual_rule).properties(
+                title="Cumulative credits vs 250,000 annual allotment", height=320
+            ),
+            use_container_width=True,
         )
 
 st.markdown("---")
