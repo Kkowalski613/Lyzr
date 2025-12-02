@@ -172,12 +172,17 @@ def model_breakdown(df: pd.DataFrame) -> pd.DataFrame:
           .reset_index()
           .rename(columns={"language_model": "Model"})
     )
+    grouped["Credits per Call"] = grouped.apply(
+        lambda row: (row["Credits"] / row["Calls"]) if row["Calls"] > 0 else np.nan,
+        axis=1,
+    )
     total_credits = grouped["Credits"].sum()
     if total_credits > 0:
         grouped["Share (%)"] = (grouped["Credits"] / total_credits * 100).round(1)
     else:
         grouped["Share (%)"] = np.nan
 
+    grouped["Credits per Call"] = grouped["Credits per Call"].round(2)
     grouped["Credits"] = grouped["Credits"].round(2)
     grouped = grouped.sort_values("Credits", ascending=False)
     return grouped
@@ -210,6 +215,11 @@ def user_breakdown(
                 .rename(columns={"email": "User"})
     )
     grouped["Credits"] = grouped["Credits"].round(2)
+    grouped["Credits per Call"] = grouped.apply(
+        lambda row: (row["Credits"] / row["Calls"]) if row["Calls"] > 0 else np.nan,
+        axis=1,
+    )
+    grouped["Credits per Call"] = grouped["Credits per Call"].round(2)
     grouped = grouped.sort_values("Credits", ascending=False)
     grouped.insert(0, "#", range(1, len(grouped) + 1))
 
@@ -231,9 +241,9 @@ def user_breakdown(
         grouped["Discipline"] = grouped["User"].str.lower().map(roles_lookup["discipline"]).fillna("")
         grouped["Office"] = grouped["User"].str.lower().map(roles_lookup["office"]).fillna("")
 
-        ordered_columns = ["#", "User", "Role", "Discipline", "Office", "Calls", "Credits", "Over 12k Credits", "Burst Detected", "Flags"]
+        ordered_columns = ["#", "User", "Role", "Discipline", "Office", "Calls", "Credits", "Credits per Call", "Over 12k Credits", "Burst Detected", "Flags"]
     else:
-        ordered_columns = ["#", "User", "Calls", "Credits", "Over 12k Credits", "Burst Detected", "Flags"]
+        ordered_columns = ["#", "User", "Calls", "Credits", "Credits per Call", "Over 12k Credits", "Burst Detected", "Flags"]
 
     return grouped[ordered_columns]
 
@@ -552,7 +562,7 @@ model_col, user_col, agent_col = st.columns([1.2, 1.4, 1.2])
 # By model
 with model_col:
     st.markdown("##### By Model")
-    st.caption("`language_model` – volume & credit share")
+    st.caption("`language_model` – calls, credits/call, and credit share")
     model_df = model_breakdown(visible_df)
 
     if model_df.empty:
@@ -567,7 +577,7 @@ with model_col:
 # By user (email)
 with user_col:
     st.markdown("##### By User (Email)")
-    st.caption("`email` – ranked by total credits, with overage (>12k) & burst flags (>10 msgs/hr)")
+    st.caption("`email` – credits/call, ranked by spend, with overage (>12k) & burst flags (>10 msgs/hr)")
     user_df = user_breakdown(
         visible_df,
         burst_users=burst_users,
@@ -600,12 +610,34 @@ with agent_col:
             hide_index=True,
         )
 
+# Per-user aggregations for charts (selected month + filters, excluding blank emails)
+user_usage_df = (
+    visible_df[visible_df["email"] != "(no email)"]
+    .groupby("email")
+    .agg(
+        Calls=("email", "size"),
+        Credits=("credits", "sum"),
+    )
+    .reset_index()
+    .rename(columns={"email": "User"})
+    .sort_values("Credits", ascending=False)
+)
+if not user_usage_df.empty:
+    user_usage_df["Credits per Call"] = user_usage_df.apply(
+        lambda row: (row["Credits"] / row["Calls"]) if row["Calls"] > 0 else np.nan,
+        axis=1,
+    )
+    user_usage_df["Credits per Call"] = user_usage_df["Credits per Call"].round(2)
+    user_usage_df["Credits"] = user_usage_df["Credits"].round(2)
+
 # ---------- Charts & visualizations ----------
 
 st.markdown("---")
 st.subheader("Visualizations")
 
-tab_org, tab_activity, tab_allotment = st.tabs(["Org Usage", "User Activity", "Credit Allotment"])
+tab_org, tab_activity, tab_allotment, tab_user_usage = st.tabs(
+    ["Org Usage", "User Activity", "Credit Allotment", "User Usage"]
+)
 
 with tab_org:
     st.caption("Credit consumption by office, discipline, and role (requires roles data).")
@@ -745,6 +777,105 @@ with tab_allotment:
         st.altair_chart(
             (cumulative_line + annual_rule).properties(
                 title="Cumulative credits vs 250,000 annual allotment", height=320
+            ),
+            use_container_width=True,
+        )
+
+with tab_user_usage:
+    st.caption("Per-user usage for the selected month (filters applied; blank emails excluded).")
+    if user_usage_df.empty:
+        st.info("No user data to display.")
+    else:
+        top_n_users = 25
+
+        top_calls = user_usage_df.sort_values("Calls", ascending=False).head(top_n_users)
+        top_credits = user_usage_df.sort_values("Credits", ascending=False).head(top_n_users)
+
+        calls_chart = (
+            alt.Chart(top_calls)
+            .mark_bar(color="#6366f1")
+            .encode(
+                y=alt.Y("User:N", sort="-x", title="User"),
+                x=alt.X("Calls:Q", title="Calls"),
+                tooltip=[
+                    alt.Tooltip("User:N", title="User"),
+                    alt.Tooltip("Calls:Q", title="Calls"),
+                    alt.Tooltip(field="Credits per Call", type="quantitative", title="Credits per Call"),
+                ],
+            )
+            .properties(title=f"Calls per user (top {top_n_users})", height=340)
+        )
+
+        credits_chart = (
+            alt.Chart(top_credits)
+            .mark_bar(color="#22c55e")
+            .encode(
+                y=alt.Y("User:N", sort="-x", title="User"),
+                x=alt.X("Credits:Q", title="Credits"),
+                tooltip=[
+                    alt.Tooltip("User:N", title="User"),
+                    alt.Tooltip("Credits:Q", title="Credits", format=","),
+                    alt.Tooltip(field="Credits per Call", type="quantitative", title="Credits per Call"),
+                ],
+            )
+            .properties(title=f"Credits per user (top {top_n_users})", height=340)
+        )
+
+        user_col1, user_col2 = st.columns(2)
+        with user_col1:
+            st.altair_chart(calls_chart, use_container_width=True)
+        with user_col2:
+            st.altair_chart(credits_chart, use_container_width=True)
+
+        mean_credits = user_usage_df["Credits"].mean()
+        std_credits = user_usage_df["Credits"].std()
+
+        dist_chart = (
+            alt.Chart(user_usage_df)
+            .mark_bar(opacity=0.75, color="#0ea5e9")
+            .encode(
+                x=alt.X("Credits:Q", bin=alt.Bin(maxbins=20), title="Credits per user"),
+                y=alt.Y("count():Q", title="Number of users"),
+                tooltip=[
+                    alt.Tooltip("count()", title="Users"),
+                ],
+            )
+        )
+
+        overlays = []
+        if pd.notna(mean_credits):
+            overlays.append(
+                alt.Chart(pd.DataFrame({"value": [mean_credits], "label": ["Mean"]}))
+                .mark_rule(color="red", strokeDash=[6, 3])
+                .encode(
+                    x="value:Q",
+                    tooltip=[alt.Tooltip("label:N"), alt.Tooltip("value:Q", format=",")]
+                )
+            )
+        if pd.notna(std_credits) and std_credits > 0:
+            overlays.append(
+                alt.Chart(
+                    pd.DataFrame(
+                        {
+                            "value": [mean_credits - std_credits, mean_credits + std_credits],
+                            "label": ["-1σ", "+1σ"],
+                        }
+                    )
+                )
+                .mark_rule(color="#f97316", strokeDash=[4, 4])
+                .encode(
+                    x="value:Q",
+                    tooltip=[alt.Tooltip("label:N"), alt.Tooltip("value:Q", format=",")]
+                )
+            )
+
+        for overlay in overlays:
+            dist_chart += overlay
+
+        st.altair_chart(
+            dist_chart.properties(
+                title="Distribution of credits consumed per user (mean ± 1σ)",
+                height=320,
             ),
             use_container_width=True,
         )
