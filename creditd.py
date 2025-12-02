@@ -1,6 +1,12 @@
-import streamlit as st
-import pandas as pd
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+import streamlit as st
+
+TOTAL_ANNUAL_CREDITS = 250_000
+MONTHLY_CREDIT_LIMIT = 12_000
+BURST_THRESHOLD = 10
 
 st.set_page_config(
     page_title="Credit Consumption Dashboard",
@@ -92,6 +98,55 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def detect_burst_users(df: pd.DataFrame, threshold: int = BURST_THRESHOLD) -> set[str]:
+    """
+    Flag users with more than `threshold` messages inside any single hour.
+    """
+    if df.empty or "created_at" not in df.columns:
+        return set()
+
+    hourly_counts = (
+        df[df["email"] != "(no email)"]
+        .assign(hour_window=lambda d: d["created_at"].dt.floor("H"))
+        .groupby(["email", "hour_window"])
+        .size()
+    )
+    return set(hourly_counts[hourly_counts > threshold].index.get_level_values("email"))
+
+
+def load_roles_mapping(uploaded_roles) -> pd.DataFrame:
+    """
+    Load the Prophet roles workbook (uploaded or local) and normalize key columns.
+    Expected columns: email, role, discipline, office (case-insensitive).
+    """
+    roles_path = Path("prophet roles.xlsx")
+    source = uploaded_roles if uploaded_roles is not None else (roles_path if roles_path.exists() else None)
+    if source is None:
+        return pd.DataFrame()
+
+    try:
+        roles_df = pd.read_excel(source)
+    except Exception as exc:  # pragma: no cover - UI warning
+        st.warning(f"Could not read Prophet roles workbook: {exc}")
+        return pd.DataFrame()
+
+    roles_df = roles_df.rename(columns={c: c.strip().lower() for c in roles_df.columns})
+    if "email" not in roles_df.columns:
+        st.warning("Prophet roles workbook is missing an 'email' column; skipping enrichment.")
+        return pd.DataFrame()
+
+    for col in ("role", "discipline", "office"):
+        if col not in roles_df.columns:
+            roles_df[col] = ""
+
+    roles_df["email"] = roles_df["email"].astype(str).str.strip().str.lower()
+    roles_df["role"] = roles_df["role"].astype(str).str.strip()
+    roles_df["discipline"] = roles_df["discipline"].astype(str).str.strip()
+    roles_df["office"] = roles_df["office"].astype(str).str.strip()
+
+    return roles_df[["email", "role", "discipline", "office"]]
+
+
 def model_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -116,9 +171,17 @@ def model_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def user_breakdown(df: pd.DataFrame) -> pd.DataFrame:
+def user_breakdown(
+    df: pd.DataFrame,
+    burst_users: set[str] | None = None,
+    roles_df: pd.DataFrame | None = None,
+    show_roles: bool = False,
+) -> pd.DataFrame:
     if df.empty:
         return df
+
+    burst_users = {u.strip().lower() for u in (burst_users or set())}
+    roles_df = roles_df if roles_df is not None else pd.DataFrame()
 
     # Exclude rows with "(no email)" from the ranking, but keep them in totals
     filtered = df[df["email"] != "(no email)"].copy()
@@ -137,7 +200,30 @@ def user_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     grouped["Credits"] = grouped["Credits"].round(2)
     grouped = grouped.sort_values("Credits", ascending=False)
     grouped.insert(0, "#", range(1, len(grouped) + 1))
-    return grouped
+
+    grouped["Over 12k Credits"] = grouped["Credits"] > MONTHLY_CREDIT_LIMIT
+    grouped["Burst Detected"] = grouped["User"].str.lower().isin(burst_users)
+    grouped["Flags"] = grouped.apply(
+        lambda row: ", ".join(
+            flag for flag in [
+                "Over monthly allotment" if row["Over 12k Credits"] else "",
+                "Burst activity" if row["Burst Detected"] else "",
+            ] if flag
+        ) or "OK",
+        axis=1,
+    )
+
+    if show_roles and not roles_df.empty:
+        roles_lookup = roles_df.drop_duplicates("email").set_index("email")
+        grouped["Role"] = grouped["User"].str.lower().map(roles_lookup["role"]).fillna("")
+        grouped["Discipline"] = grouped["User"].str.lower().map(roles_lookup["discipline"]).fillna("")
+        grouped["Office"] = grouped["User"].str.lower().map(roles_lookup["office"]).fillna("")
+
+        ordered_columns = ["#", "User", "Role", "Discipline", "Office", "Calls", "Credits", "Over 12k Credits", "Burst Detected", "Flags"]
+    else:
+        ordered_columns = ["#", "User", "Calls", "Credits", "Over 12k Credits", "Burst Detected", "Flags"]
+
+    return grouped[ordered_columns]
 
 
 def agent_breakdown(df: pd.DataFrame) -> pd.DataFrame:
@@ -158,6 +244,26 @@ def agent_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def style_user_dataframe(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """
+    Highlight users exceeding the monthly allotment in red for quick scanning.
+    """
+    if df.empty:
+        return df.style
+
+    def highlight_user(row: pd.Series) -> list[str]:
+        should_highlight = bool(row.get("Over 12k Credits", False))
+        styles = []
+        for col_name in row.index:
+            if col_name == "User" and should_highlight:
+                styles.append("color: red; font-weight: 600;")
+            else:
+                styles.append("")
+        return styles
+
+    return df.style.apply(highlight_user, axis=1)
+
+
 # ---------- UI ----------
 
 st.markdown(
@@ -175,8 +281,8 @@ st.title("💳 Credit Consumption Dashboard")
 st.markdown(
     """
     Review credit consumption by **model**, **user (email)**, and **agent ID**  
-    from your monthly export, with credits sourced from `cost_in_credits`
-    and only rows with a proper `Id` included.
+    from your monthly export, with credits sourced from `actions`
+    and only rows with a proper `log_id` included.
     """
 )
 
@@ -186,7 +292,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Upload CSV export",
         type=["csv"],
-        help="Uses columns: Id, agent_id, call_type, language_model, email, cost_in_credits, created_at"
+        help="Uses columns: log_id, agent_id, call_type, language_model, email, actions (credits), created_at"
     )
 
     include_embeddings = st.checkbox(
@@ -194,11 +300,27 @@ with st.sidebar:
         value=True
     )
 
+    roles_file = st.file_uploader(
+        "Upload Prophet roles.xlsx (optional)",
+        type=["xlsx"],
+        help="Adds role, discipline, and office columns by matching email.",
+    )
+    roles_toggle_default = roles_file is not None or Path("prophet roles.xlsx").exists()
+    show_roles = (
+        st.checkbox(
+            "Show role/discipline/office (if available)",
+            value=roles_toggle_default,
+            help="Requires Prophet roles.xlsx (uploaded or in the app folder).",
+        )
+        if roles_toggle_default
+        else False
+    )
+
     st.markdown(
         """
         <div class="small-text">
-        Rows are dropped if: invalid/missing <code>Id</code>, 
-        <code>credits</code> ≤ 0, missing <code>call_type</code> /
+        Rows are dropped if: invalid/missing <code>log_id</code>, 
+        <code>credits</code> (actions) ≤ 0, missing <code>call_type</code> /
         <code>language_model</code>, or invalid <code>created_at</code>.
         </div>
         """,
@@ -222,6 +344,20 @@ if clean_df.empty:
     st.error("No valid rows after cleaning. Check that the CSV uses the expected columns.")
     st.stop()
 
+roles_df = load_roles_mapping(roles_file)
+roles_available = show_roles and not roles_df.empty
+if show_roles and roles_df.empty:
+    st.info("Prophet roles.xlsx not provided or unreadable. Role enrichment is skipped.")
+
+# Monthly consumption pattern (for projections)
+monthly_totals = clean_df.groupby("month_key")["credits"].sum()
+observed_months = len(monthly_totals)
+avg_monthly_usage = monthly_totals.mean() if observed_months > 0 else np.nan
+projected_annual_usage = avg_monthly_usage * 12 if observed_months > 0 else np.nan
+estimated_remaining = (
+    TOTAL_ANNUAL_CREDITS - projected_annual_usage if pd.notna(projected_annual_usage) else np.nan
+)
+
 # Month choices
 available_months = sorted(clean_df["month_key"].dropna().unique())
 month_labels = {
@@ -243,6 +379,8 @@ if include_embeddings:
 else:
     visible_df = month_slice[month_slice["call_type"] != "aembedding"].copy()
 
+burst_users = detect_burst_users(visible_df, threshold=BURST_THRESHOLD)
+
 # Embedding share is *always* computed on the full month
 embeddings_df = month_slice[month_slice["call_type"] == "aembedding"]
 total_month_credits = month_slice["credits"].sum()
@@ -263,7 +401,7 @@ with col1:
         f"{total_credits_visible:,.2f}" if total_calls_visible > 0 else "—",
     )
     st.markdown(
-        '<div class="metric-subtitle">From cost_in_credits, after filters</div>',
+        '<div class="metric-subtitle">From actions/credits, after filters</div>',
         unsafe_allow_html=True,
     )
 
@@ -273,7 +411,7 @@ with col2:
         f"{total_calls_visible:,.0f}" if total_calls_visible > 0 else "—",
     )
     st.markdown(
-        '<div class="metric-subtitle">Only rows with a proper Id</div>',
+        '<div class="metric-subtitle">Only rows with a proper log_id</div>',
         unsafe_allow_html=True,
     )
 
@@ -298,6 +436,30 @@ with col4:
         unsafe_allow_html=True,
     )
 
+projection_col1, projection_col2 = st.columns(2)
+
+with projection_col1:
+    st.metric(
+        "Projected Annual Usage",
+        f"{projected_annual_usage:,.0f}" if pd.notna(projected_annual_usage) else "—",
+        help="Average monthly credits x 12 (based on available months).",
+    )
+    st.markdown(
+        f'<div class="metric-subtitle">Observed months: {observed_months or "—"}</div>',
+        unsafe_allow_html=True,
+    )
+
+with projection_col2:
+    st.metric(
+        "Estimated Credits Remaining",
+        f"{estimated_remaining:,.0f}" if pd.notna(estimated_remaining) else "—",
+        help=f"Total pool {TOTAL_ANNUAL_CREDITS:,.0f} minus projected annual usage.",
+    )
+    st.markdown(
+        '<div class="metric-subtitle">Total annual credits: 250,000</div>',
+        unsafe_allow_html=True,
+    )
+
 st.markdown(
     f"""
     <div class="small-text">
@@ -305,7 +467,7 @@ st.markdown(
     {total_month_credits:,.2f} total credits · 
     {len(month_slice):,} clean rows
     &nbsp;·&nbsp;
-    {dropped_rows:,} rows removed from original {total_rows:,} (invalid Id / credits / fields)
+    {dropped_rows:,} rows removed from original {total_rows:,} (invalid log_id / credits / fields)
     </div>
     """,
     unsafe_allow_html=True,
@@ -343,14 +505,20 @@ with model_col:
 # By user (email)
 with user_col:
     st.markdown("##### By User (Email)")
-    st.caption("`email` – ranked by total credits")
-    user_df = user_breakdown(visible_df)
+    st.caption("`email` – ranked by total credits, with overage (>12k) & burst flags (>10 msgs/hr)")
+    user_df = user_breakdown(
+        visible_df,
+        burst_users=burst_users,
+        roles_df=roles_df,
+        show_roles=roles_available,
+    )
 
     if user_df.empty:
         st.info("No user data to display (no valid emails).")
     else:
+        styled_users = style_user_dataframe(user_df)
         st.dataframe(
-            user_df,
+            styled_users,
             use_container_width=True,
             hide_index=True,
         )
@@ -374,8 +542,8 @@ st.markdown("---")
 st.markdown(
     """
     <div class="small-text">
-    Cleaning rules: rows are excluded if <code>Id</code> is missing/short,
-    <code>cost_in_credits</code> is non-numeric or ≤ 0, 
+    Cleaning rules: rows are excluded if <code>log_id</code> is missing/short,
+    <code>actions</code> is non-numeric or ≤ 0, 
     <code>call_type</code> or <code>language_model</code> are blank,
     or <code>created_at</code> is invalid.
     </div>
