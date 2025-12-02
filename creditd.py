@@ -244,7 +244,7 @@ def agent_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def style_user_dataframe(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+def style_user_dataframe(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
     """
     Highlight users exceeding the monthly allotment in red for quick scanning.
     """
