@@ -87,7 +87,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df["month_key"] = df["created_at"].dt.to_period("M").astype(str)
 
     # 6) Email normalization (avoid NaN showing up)
-    df["email"] = df["email"].astype(str).str.strip()
+    df["email"] = df["email"].astype(str).str.strip().str.lower()
     bad_email_values = {"", "nan", "NaN", "none", "None", "null", "Null"}
     df.loc[df["email"].str.lower().isin(bad_email_values), "email"] = "(no email)"
 
@@ -136,6 +136,8 @@ def load_roles_mapping(uploaded_roles) -> pd.DataFrame:
     # Normalize common alternate headers
     alias_map = {
         "column1": "email",          # sample workbook
+        "column m": "email",
+        "column_m": "email",
         "broader role": "role",
         "broader_role": "role",
     }
@@ -269,11 +271,9 @@ def enrich_with_roles(df: pd.DataFrame, roles_df: pd.DataFrame) -> pd.DataFrame:
         return result
 
     lookup = roles_df.drop_duplicates("email").set_index("email")
-    result["email_lower"] = result["email"].astype(str).str.lower()
-    result["role"] = result["email_lower"].map(lookup["role"]).fillna("")
-    result["discipline"] = result["email_lower"].map(lookup["discipline"]).fillna("")
-    result["office"] = result["email_lower"].map(lookup["office"]).fillna("")
-    result = result.drop(columns=["email_lower"])
+    result["role"] = result["email"].map(lookup["role"]).fillna("")
+    result["discipline"] = result["email"].map(lookup["discipline"]).fillna("")
+    result["office"] = result["email"].map(lookup["office"]).fillna("")
     return result
 
 
