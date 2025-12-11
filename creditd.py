@@ -25,6 +25,33 @@ def normalize_column_name(col: str) -> str:
     return str(col).strip().lower().replace(" ", "_")
 
 
+def find_local_roles_workbook() -> Path | None:
+    """
+    Locate a local Prophet roles workbook, preferring common filenames and falling
+    back to any *.xlsx that looks like a Prophet roles file.
+    """
+    candidates = [
+        Path("prophet roles.xlsx"),
+        Path("Prophet Roles.xlsx"),
+        Path("Prophet roles.xlsx"),
+        Path("Prophet Final Roles.xlsx"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    for path in Path(".").glob("*.xlsx"):
+        name = path.name.lower()
+        if "prophet" in name and "role" in name:
+            return path
+
+    for path in Path(".").glob("*.xlsx"):
+        if "prophet" in path.name.lower():
+            return path
+
+    return None
+
+
 def extract_latency_ms(df: pd.DataFrame) -> pd.Series:
     """
     Look for a latency column and return a Series in milliseconds.
@@ -171,15 +198,18 @@ def load_roles_mapping(uploaded_roles) -> pd.DataFrame:
     Load the Prophet roles workbook (uploaded or local) and normalize key columns.
     Expected columns: email, role, discipline, office (case-insensitive).
     """
-    roles_path = Path("prophet roles.xlsx")
-    source = uploaded_roles if uploaded_roles is not None else (roles_path if roles_path.exists() else None)
+    local_roles = find_local_roles_workbook()
+    source = uploaded_roles if uploaded_roles is not None else local_roles
+    source_label = getattr(uploaded_roles, "name", None) if uploaded_roles is not None else (local_roles.name if local_roles else None)
+
     if source is None:
         return pd.DataFrame()
 
     try:
         roles_df = pd.read_excel(source)
     except Exception as exc:  # pragma: no cover - UI warning
-        st.warning(f"Could not read Prophet roles workbook: {exc}")
+        label = source_label or "Prophet roles workbook"
+        st.warning(f"Could not read {label}: {exc}")
         return pd.DataFrame()
 
     # Normalize common alternate headers
@@ -198,7 +228,8 @@ def load_roles_mapping(uploaded_roles) -> pd.DataFrame:
     roles_df = roles_df.rename(columns=normalized_columns)
 
     if "email" not in roles_df.columns:
-        st.warning("Prophet roles workbook is missing an 'email' column; skipping enrichment.")
+        label = source_label or "Prophet roles workbook"
+        st.warning(f"{label} is missing an 'email' column; skipping enrichment.")
         return pd.DataFrame()
 
     for col in ("role", "discipline", "office"):
@@ -397,12 +428,13 @@ with st.sidebar:
         value=True
     )
 
+    local_roles_path = find_local_roles_workbook()
     roles_file = st.file_uploader(
         "Upload Prophet roles.xlsx (optional)",
         type=["xlsx"],
         help="Adds role, discipline, and office columns by matching email.",
     )
-    roles_toggle_default = roles_file is not None or Path("prophet roles.xlsx").exists()
+    roles_toggle_default = roles_file is not None or local_roles_path is not None
     show_roles = (
         st.checkbox(
             "Show role/discipline/office (if available)",
@@ -412,6 +444,8 @@ with st.sidebar:
         if roles_toggle_default
         else False
     )
+    if local_roles_path is not None and roles_file is None:
+        st.caption(f"Using local roles workbook: {local_roles_path.name}")
 
     st.markdown(
         """
@@ -1002,6 +1036,61 @@ with tab_latency:
             .properties(title="Latency over time", height=320)
         )
         st.altair_chart(latency_chart, use_container_width=True)
+
+        st.markdown("##### Latency by model")
+        latency_by_model = (
+            latency_df
+            .groupby("language_model")
+            .agg(
+                avg_latency_ms=("latency_ms", "mean"),
+                p95_latency_ms=("latency_ms", lambda s: s.quantile(0.95)),
+                samples=("latency_ms", "count"),
+            )
+            .reset_index()
+            .rename(columns={"language_model": "Model"})
+            .sort_values("p95_latency_ms", ascending=False)
+        )
+
+        if latency_by_model.empty:
+            st.info("No latency data by model.")
+        else:
+            latency_by_model_display = latency_by_model.copy()
+            latency_by_model_display["avg_latency_ms"] = latency_by_model_display["avg_latency_ms"].round(0)
+            latency_by_model_display["p95_latency_ms"] = latency_by_model_display["p95_latency_ms"].round(0)
+            st.dataframe(
+                latency_by_model_display,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            latency_model_long = latency_by_model.melt(
+                id_vars=["Model", "samples"],
+                value_vars=["avg_latency_ms", "p95_latency_ms"],
+                var_name="Metric",
+                value_name="LatencyMs",
+            )
+            latency_model_long["Metric"] = latency_model_long["Metric"].map({
+                "avg_latency_ms": "Average (ms)",
+                "p95_latency_ms": "P95 (ms)",
+            })
+
+            model_latency_chart = (
+                alt.Chart(latency_model_long)
+                .mark_bar()
+                .encode(
+                    y=alt.Y("Model:N", sort="-x", title="Model"),
+                    x=alt.X("LatencyMs:Q", title="Latency (ms)"),
+                    color=alt.Color("Metric:N", title="Metric"),
+                    tooltip=[
+                        alt.Tooltip("Model:N", title="Model"),
+                        alt.Tooltip("Metric:N"),
+                        alt.Tooltip("LatencyMs:Q", format=",.0f", title="Latency (ms)"),
+                        alt.Tooltip("samples:Q", format=",", title="Samples"),
+                    ],
+                )
+                .properties(title="Latency by model", height=320)
+            )
+            st.altair_chart(model_latency_chart, use_container_width=True)
 
 with tab_daily_users:
     st.caption("Layered daily credit consumption by top users (filters applied).")
