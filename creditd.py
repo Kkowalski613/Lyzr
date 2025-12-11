@@ -17,6 +17,54 @@ st.set_page_config(
 
 # ---------- Helpers ----------
 
+def normalize_column_name(col: str) -> str:
+    """
+    Normalize a column name to a lowercase, underscore form for robust matching.
+    Handles non-string/blank headers without raising.
+    """
+    return str(col).strip().lower().replace(" ", "_")
+
+
+def extract_latency_ms(df: pd.DataFrame) -> pd.Series:
+    """
+    Look for a latency column and return a Series in milliseconds.
+    Supports common variants like latency (seconds), latency_ms, duration_ms, etc.
+    """
+    if df.empty:
+        return pd.Series(dtype="float")
+
+    latency_aliases = {
+        "latency_ms": "ms",
+        "latency": "s",
+        "latency_seconds": "s",
+        "latency_s": "s",
+        "response_time_ms": "ms",
+        "duration_ms": "ms",
+        "elapsed_ms": "ms",
+    }
+
+    normalized_cols = {col: normalize_column_name(col) for col in df.columns}
+    selected_col = None
+    selected_unit = "ms"
+
+    for original, normalized in normalized_cols.items():
+        if normalized in latency_aliases:
+            selected_col = original
+            selected_unit = latency_aliases[normalized]
+            break
+
+    if selected_col is None:
+        return pd.Series(pd.NA, index=df.index, dtype="float")
+
+    latency_series = pd.to_numeric(df[selected_col], errors="coerce")
+    if selected_unit == "s":
+        latency_series = latency_series * 1000
+
+    # Negative latencies are treated as missing
+    latency_series = latency_series.where(latency_series >= 0)
+    return latency_series
+
+
 def parse_date_safe(series: pd.Series) -> pd.Series:
     # Your created_at now looks like "12/1/25"
     # Let pandas infer the format; errors become NaT
@@ -96,6 +144,9 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     bad_agent_values = {"", "nan", "NaN", "none", "None", "null", "Null"}
     df.loc[df["agent_id"].str.lower().isin(bad_agent_values), "agent_id"] = "(unassigned)"
 
+    # 8) Latency (optional, kept as-is even when missing)
+    df["latency_ms"] = extract_latency_ms(df)
+
     return df
 
 
@@ -131,8 +182,6 @@ def load_roles_mapping(uploaded_roles) -> pd.DataFrame:
         st.warning(f"Could not read Prophet roles workbook: {exc}")
         return pd.DataFrame()
 
-    roles_df = roles_df.rename(columns={c: c.strip().lower() for c in roles_df.columns})
-
     # Normalize common alternate headers
     alias_map = {
         "column1": "email",          # sample workbook
@@ -141,7 +190,12 @@ def load_roles_mapping(uploaded_roles) -> pd.DataFrame:
         "broader role": "role",
         "broader_role": "role",
     }
-    roles_df = roles_df.rename(columns=lambda c: alias_map.get(c, c))
+
+    normalized_columns = {}
+    for col in roles_df.columns:
+        normalized = normalize_column_name(col)
+        normalized_columns[col] = alias_map.get(normalized, normalized)
+    roles_df = roles_df.rename(columns=normalized_columns)
 
     if "email" not in roles_df.columns:
         st.warning("Prophet roles workbook is missing an 'email' column; skipping enrichment.")
@@ -508,6 +562,30 @@ with col4:
         unsafe_allow_html=True,
     )
 
+latency_samples = visible_df["latency_ms"].dropna() if "latency_ms" in visible_df.columns else pd.Series(dtype="float")
+if not latency_samples.empty:
+    lat_col1, lat_col2, lat_col3 = st.columns(3)
+    with lat_col1:
+        st.metric(
+            "Avg Latency",
+            f"{latency_samples.mean():,.0f} ms",
+            help="Average latency where provided in the export.",
+        )
+    with lat_col2:
+        st.metric(
+            "P95 Latency",
+            f"{latency_samples.quantile(0.95):,.0f} ms",
+            help="95th percentile latency (ms).",
+        )
+    with lat_col3:
+        st.metric(
+            "Latency Samples",
+            f"{len(latency_samples):,}",
+            help="Rows with a usable latency value.",
+        )
+else:
+    st.caption("Latency data not found in this export.")
+
 projection_col1, projection_col2 = st.columns(2)
 
 with projection_col1:
@@ -635,8 +713,8 @@ if not user_usage_df.empty:
 st.markdown("---")
 st.subheader("Visualizations")
 
-tab_org, tab_activity, tab_allotment, tab_user_usage = st.tabs(
-    ["Org Usage", "User Activity", "Credit Allotment", "User Usage"]
+tab_org, tab_activity, tab_allotment, tab_user_usage, tab_latency, tab_daily_users = st.tabs(
+    ["Org Usage", "User Activity", "Credit Allotment", "User Usage", "Latency", "Daily Credits"]
 )
 
 with tab_org:
@@ -879,6 +957,95 @@ with tab_user_usage:
             ),
             use_container_width=True,
         )
+
+with tab_latency:
+    st.caption("Latency trends for the selected month (when latency is present in the export).")
+    latency_df = visible_df.dropna(subset=["latency_ms"]) if "latency_ms" in visible_df.columns else pd.DataFrame()
+
+    if latency_df.empty:
+        st.info("No latency data available for this month.")
+    else:
+        latency_df = latency_df.copy()
+        latency_df["date"] = latency_df["created_at"].dt.date
+        daily_latency = (
+            latency_df
+            .groupby("date")["latency_ms"]
+            .agg(
+                avg_latency_ms="mean",
+                p95_latency_ms=lambda s: s.quantile(0.95),
+            )
+            .reset_index()
+        )
+        daily_latency["date"] = pd.to_datetime(daily_latency["date"])
+        latency_long = daily_latency.melt(
+            id_vars=["date"],
+            value_vars=["avg_latency_ms", "p95_latency_ms"],
+            var_name="Metric",
+            value_name="LatencyMs",
+        )
+        latency_labels = {"avg_latency_ms": "Average (ms)", "p95_latency_ms": "P95 (ms)"}
+        latency_long["Metric"] = latency_long["Metric"].map(latency_labels)
+
+        latency_chart = (
+            alt.Chart(latency_long)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("LatencyMs:Q", title="Latency (ms)"),
+                color=alt.Color("Metric:N", title="Metric"),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("Metric:N"),
+                    alt.Tooltip("LatencyMs:Q", format=",.0f", title="Latency (ms)"),
+                ],
+            )
+            .properties(title="Latency over time", height=320)
+        )
+        st.altair_chart(latency_chart, use_container_width=True)
+
+with tab_daily_users:
+    st.caption("Layered daily credit consumption by top users (filters applied).")
+    daily_usage = visible_df[visible_df["email"] != "(no email)"].copy()
+
+    if daily_usage.empty:
+        st.info("No user data available for daily breakdown.")
+    else:
+        daily_usage["date"] = daily_usage["created_at"].dt.date
+        top_n_users = 5
+        top_users = (
+            daily_usage.groupby("email")["credits"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(top_n_users)
+            .index.tolist()
+        )
+
+        layered_daily = (
+            daily_usage[daily_usage["email"].isin(top_users)]
+            .groupby(["date", "email"])["credits"]
+            .sum()
+            .reset_index()
+            .rename(columns={"email": "User", "credits": "Credits"})
+        )
+        layered_daily["date"] = pd.to_datetime(layered_daily["date"])
+
+        base = (
+            alt.Chart(layered_daily)
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("Credits:Q", title="Credits per day"),
+                color=alt.Color("User:N", title="User", sort=top_users),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("User:N", title="User"),
+                    alt.Tooltip("Credits:Q", format=",", title="Credits"),
+                ],
+            )
+            .properties(title=f"Top {top_n_users} users by daily credits", height=340)
+        )
+
+        layered_chart = base.mark_area(opacity=0.15) + base.mark_line(point=True, strokeWidth=2)
+        st.altair_chart(layered_chart, use_container_width=True)
 
 st.markdown("---")
 st.markdown(
