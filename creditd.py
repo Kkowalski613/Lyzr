@@ -103,6 +103,101 @@ def get_month_key(dt_series: pd.Series) -> pd.Series:
     return dt_series.dt.to_period("M").astype(str)
 
 
+TIME_GRANULARITIES = ("Monthly", "Weekly", "Daily")
+
+
+def format_period_label(period: str, granularity: str) -> str:
+    """
+    Human-friendly label for a period key based on the selected granularity.
+    """
+    try:
+        if granularity == "Monthly":
+            ts = pd.Period(period, freq="M").to_timestamp()
+            return ts.strftime("%B %Y")
+        if granularity == "Weekly":
+            start = pd.Period(period, freq="W-SUN").start_time
+            end = start + pd.Timedelta(days=6)
+            return f"{start:%b %d, %Y} – {end:%b %d, %Y}"
+        if granularity == "Daily":
+            ts = pd.to_datetime(period)
+            return ts.strftime("%b %d, %Y")
+    except Exception:
+        return str(period)
+
+    return str(period)
+
+
+def period_sort_key(period: str, granularity: str) -> pd.Timestamp:
+    """
+    Produce a sortable timestamp for chronological ordering of period keys.
+    """
+    try:
+        if granularity == "Monthly":
+            return pd.Period(period, freq="M").start_time
+        if granularity == "Weekly":
+            return pd.Period(period, freq="W-SUN").start_time
+        if granularity == "Daily":
+            return pd.to_datetime(period)
+    except Exception:
+        return pd.Timestamp.min
+
+    return pd.Timestamp.min
+
+
+def build_period_options(df: pd.DataFrame, granularity: str) -> tuple[list[str], dict[str, str]]:
+    """
+    Return sorted period keys and labels for the given granularity.
+    """
+    column_map = {"Monthly": "month_key", "Weekly": "week_key", "Daily": "date_key"}
+    column = column_map.get(granularity)
+    if column is None or column not in df.columns:
+        return [], {}
+
+    unique_periods = df[column].dropna().astype(str).unique()
+    sorted_periods = sorted(unique_periods, key=lambda p: period_sort_key(p, granularity))
+    labels = {p: format_period_label(p, granularity) for p in sorted_periods}
+    return sorted_periods, labels
+
+
+def compute_rank_map(df: pd.DataFrame) -> dict[str, int]:
+    """
+    Create a mapping of user -> rank (#) based on total credits within a period.
+    """
+    if df.empty or "email" not in df.columns:
+        return {}
+
+    filtered = df[df["email"] != "(no email)"].copy()
+    if filtered.empty:
+        return {}
+
+    grouped = (
+        filtered.groupby("email", dropna=False)["credits"]
+        .sum()
+        .round(2)
+        .reset_index()
+        .rename(columns={"email": "User", "credits": "Credits"})
+        .sort_values("Credits", ascending=False)
+        .reset_index(drop=True)
+    )
+    grouped["rank"] = grouped.index + 1
+    return dict(zip(grouped["User"].str.lower(), grouped["rank"]))
+
+
+def format_rank_change(current_rank: int, previous_rank: int | None) -> str:
+    """
+    Format the rank delta with arrows for quick scanning.
+    """
+    if previous_rank is None:
+        return "—"
+
+    delta = previous_rank - current_rank
+    if delta > 0:
+        return f"▲{delta}"
+    if delta < 0:
+        return f"▼{abs(delta)}"
+    return "—"
+
+
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     Clean & normalize your export using the actual column names:
@@ -160,6 +255,8 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # 5) Month key for the selector
     df["month_key"] = df["created_at"].dt.to_period("M").astype(str)
+    df["week_key"] = df["created_at"].dt.to_period("W-SUN").astype(str)
+    df["date_key"] = df["created_at"].dt.date.astype(str)
 
     # 6) Email normalization (avoid NaN showing up)
     df["email"] = df["email"].astype(str).str.strip().str.lower()
@@ -278,12 +375,14 @@ def user_breakdown(
     burst_users: set[str] | None = None,
     roles_df: pd.DataFrame | None = None,
     show_roles: bool = False,
+    previous_ranks: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     if df.empty:
         return df
 
     burst_users = {u.strip().lower() for u in (burst_users or set())}
     roles_df = roles_df if roles_df is not None else pd.DataFrame()
+    previous_ranks = {u.strip().lower(): rank for u, rank in (previous_ranks or {}).items()}
 
     # Exclude rows with "(no email)" from the ranking, but keep them in totals
     filtered = df[df["email"] != "(no email)"].copy()
@@ -307,6 +406,17 @@ def user_breakdown(
     grouped["Credits per Call"] = grouped["Credits per Call"].round(2)
     grouped = grouped.sort_values("Credits", ascending=False)
     grouped.insert(0, "#", range(1, len(grouped) + 1))
+    grouped.insert(
+        1,
+        "Rank Change",
+        grouped.apply(
+            lambda row: format_rank_change(
+                row["#"],
+                previous_ranks.get(row["User"].strip().lower()) if previous_ranks else None,
+            ),
+            axis=1,
+        ),
+    )
 
     grouped["Over 12k Credits"] = grouped["Credits"] > MONTHLY_CREDIT_LIMIT
     grouped["Burst Detected"] = grouped["User"].str.lower().isin(burst_users)
@@ -326,9 +436,9 @@ def user_breakdown(
         grouped["Discipline"] = grouped["User"].str.lower().map(roles_lookup["discipline"]).fillna("")
         grouped["Office"] = grouped["User"].str.lower().map(roles_lookup["office"]).fillna("")
 
-        ordered_columns = ["#", "User", "Role", "Discipline", "Office", "Calls", "Credits", "Credits per Call", "Over 12k Credits", "Burst Detected", "Flags"]
+        ordered_columns = ["#", "Rank Change", "User", "Role", "Discipline", "Office", "Calls", "Credits", "Credits per Call", "Over 12k Credits", "Burst Detected", "Flags"]
     else:
-        ordered_columns = ["#", "User", "Calls", "Credits", "Credits per Call", "Over 12k Credits", "Burst Detected", "Flags"]
+        ordered_columns = ["#", "Rank Change", "User", "Calls", "Credits", "Credits per Call", "Over 12k Credits", "Burst Detected", "Flags"]
 
     return grouped[ordered_columns]
 
@@ -517,35 +627,55 @@ monthly_usage_df["month_label"] = monthly_usage_df["month_key"].apply(
 )
 monthly_usage_df["cumulative_credits"] = monthly_usage_df["total_credits"].cumsum()
 
-# Month choices
-available_months = sorted(clean_df["month_key"].dropna().unique())
-month_labels = {
-    month: pd.Period(month).to_timestamp().strftime("%B %Y") for month in available_months
-}
-
-selected_month = st.selectbox(
-    "Month",
-    options=available_months,
-    format_func=lambda m: month_labels.get(m, m),
-    index=len(available_months) - 1 if available_months else 0,
+# Timeframe selection (month/week/day)
+time_granularity = st.radio(
+    "Timeframe",
+    TIME_GRANULARITIES,
+    index=0,
+    horizontal=True,
 )
+period_column_map = {"Monthly": "month_key", "Weekly": "week_key", "Daily": "date_key"}
+selected_column = period_column_map[time_granularity]
 
-month_slice = clean_df[clean_df["month_key"] == selected_month].copy()
+available_periods, period_labels = build_period_options(clean_df, time_granularity)
+if not available_periods:
+    st.error("No usable periods found after cleaning.")
+    st.stop()
+
+selected_period = st.selectbox(
+    f"{time_granularity} period",
+    options=available_periods,
+    format_func=lambda p: period_labels.get(p, p),
+    index=len(available_periods) - 1,
+)
+selected_period_label = period_labels.get(selected_period, selected_period)
+period_slice = clean_df[clean_df[selected_column] == selected_period].copy()
+
+previous_visible_df = pd.DataFrame()
+selected_idx = available_periods.index(selected_period)
+if selected_idx > 0:
+    previous_slice = clean_df[clean_df[selected_column] == available_periods[selected_idx - 1]].copy()
+    if include_embeddings:
+        previous_visible_df = previous_slice.copy()
+    else:
+        previous_visible_df = previous_slice[previous_slice["call_type"] != "aembedding"].copy()
 
 # Apply embeddings toggle
 if include_embeddings:
-    visible_df = month_slice.copy()
+    visible_df = period_slice.copy()
 else:
-    visible_df = month_slice[month_slice["call_type"] != "aembedding"].copy()
+    visible_df = period_slice[period_slice["call_type"] != "aembedding"].copy()
 
+previous_ranks = compute_rank_map(previous_visible_df)
 burst_users = detect_burst_users(visible_df, threshold=BURST_THRESHOLD)
 visible_enriched_df = enrich_with_roles(visible_df, roles_df)
 
-# Embedding share is *always* computed on the full month
-embeddings_df = month_slice[month_slice["call_type"] == "aembedding"]
-total_month_credits = month_slice["credits"].sum()
+# Embedding share is *always* computed on the full period
+embeddings_df = period_slice[period_slice["call_type"] == "aembedding"]
+total_period_credits = period_slice["credits"].sum()
 embedding_credits = embeddings_df["credits"].sum()
-embedding_share = (embedding_credits / total_month_credits) if total_month_credits > 0 else np.nan
+embedding_share = (embedding_credits / total_period_credits) if total_period_credits > 0 else np.nan
+period_label_short = {"Monthly": "Month", "Weekly": "Week", "Daily": "Day"}[time_granularity]
 
 # ---------- Top metrics ----------
 
@@ -557,7 +687,7 @@ col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.metric(
-        "Total Credits (Selected Month)",
+        f"Total Credits (Selected {period_label_short})",
         f"{total_credits_visible:,.2f}" if total_calls_visible > 0 else "—",
     )
     st.markdown(
@@ -589,10 +719,10 @@ with col4:
     st.metric(
         "Embedding Share (Credits)",
         f"{embedding_share * 100:,.1f} %" if pd.notna(embedding_share) else "—",
-        help="Share of total monthly credits attributed to call_type = aembedding."
+        help="Share of total credits in this period attributed to call_type = aembedding."
     )
     st.markdown(
-        '<div class="metric-subtitle">Computed on full month, regardless of toggle</div>',
+        '<div class="metric-subtitle">Computed on full period, regardless of toggle</div>',
         unsafe_allow_html=True,
     )
 
@@ -647,9 +777,9 @@ with projection_col2:
 st.markdown(
     f"""
     <div class="small-text">
-    {month_labels.get(selected_month, selected_month)} · 
-    {total_month_credits:,.2f} total credits · 
-    {len(month_slice):,} clean rows
+    {selected_period_label} · 
+    {total_period_credits:,.2f} total credits · 
+    {len(period_slice):,} clean rows
     &nbsp;·&nbsp;
     {dropped_rows:,} rows removed from original {total_rows:,} (invalid log_id / credits / fields)
     </div>
@@ -664,8 +794,8 @@ st.subheader("Breakdowns")
 
 if visible_df.empty:
     st.warning(
-        "No rows remaining after filters for this month. "
-        "Try toggling embeddings back on or picking a different month."
+        "No rows remaining after filters for this period. "
+        "Try toggling embeddings back on or picking a different period."
     )
     st.stop()
 
@@ -689,12 +819,13 @@ with model_col:
 # By user (email)
 with user_col:
     st.markdown("##### By User (Email)")
-    st.caption("`email` – credits/call, ranked by spend, with overage (>12k) & burst flags (>10 msgs/hr)")
+    st.caption("`email` – credits/call, ranked by spend, with overage (>12k), burst flags (>10 msgs/hr), and rank change vs previous period")
     user_df = user_breakdown(
         visible_df,
         burst_users=burst_users,
         roles_df=roles_df,
         show_roles=roles_available,
+        previous_ranks=previous_ranks,
     )
 
     if user_df.empty:
@@ -722,7 +853,7 @@ with agent_col:
             hide_index=True,
         )
 
-# Per-user aggregations for charts (selected month + filters, excluding blank emails)
+# Per-user aggregations for charts (selected period + filters, excluding blank emails)
 user_usage_df = (
     visible_df[visible_df["email"] != "(no email)"]
     .groupby("email")
@@ -894,7 +1025,7 @@ with tab_allotment:
         )
 
 with tab_user_usage:
-    st.caption("Per-user usage for the selected month (filters applied; blank emails excluded).")
+    st.caption("Per-user usage for the selected period (filters applied; blank emails excluded).")
     if user_usage_df.empty:
         st.info("No user data to display.")
     else:
@@ -993,11 +1124,11 @@ with tab_user_usage:
         )
 
 with tab_latency:
-    st.caption("Latency trends for the selected month (when latency is present in the export).")
+    st.caption("Latency trends for the selected period (when latency is present in the export).")
     latency_df = visible_df.dropna(subset=["latency_ms"]) if "latency_ms" in visible_df.columns else pd.DataFrame()
 
     if latency_df.empty:
-        st.info("No latency data available for this month.")
+        st.info("No latency data available for this period.")
     else:
         latency_df = latency_df.copy()
         latency_df["date"] = latency_df["created_at"].dt.date
