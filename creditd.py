@@ -590,6 +590,10 @@ def agent_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
+    df = df.copy()
+    if "agent_name" not in df.columns:
+        df["agent_name"] = ""
+
     grouped = (
         df.groupby(["agent_id", "agent_name"], dropna=False)
           .agg(
