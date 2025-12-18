@@ -1620,6 +1620,44 @@ with tab_agent_latency:
                     st.markdown("###### Memory")
                     render_flag_chart(mem_df, "Memory")
 
+                st.markdown("##### Model distribution across mapped agents")
+                model_agents = visible_enriched_df[visible_enriched_df["agent_name"] != ""].copy()
+                model_agents = model_agents[model_agents["language_model"].notna()]
+                if model_agents.empty:
+                    st.info("No mapped agents with model data in this period.")
+                else:
+                    unique_agent_model = model_agents[["agent_id", "agent_name", "language_model"]].drop_duplicates()
+                    total_mapped_agents = unique_agent_model["agent_id"].nunique()
+                    model_distribution = (
+                        unique_agent_model
+                        .groupby("language_model")["agent_id"]
+                        .nunique()
+                        .reset_index()
+                        .rename(columns={"language_model": "Model", "agent_id": "Agents"})
+                        .sort_values("Agents", ascending=False)
+                    )
+                    model_distribution["Agent Share (%)"] = (
+                        model_distribution["Agents"] / total_mapped_agents * 100
+                    ).round(1)
+
+                    st.dataframe(model_distribution, use_container_width=True, hide_index=True)
+
+                    dist_chart = (
+                        alt.Chart(model_distribution)
+                        .mark_bar()
+                        .encode(
+                            y=alt.Y("Model:N", sort="-x", title="Model"),
+                            x=alt.X("Agent Share (%):Q", title="Share of mapped agents (%)"),
+                            tooltip=[
+                                alt.Tooltip("Model:N", title="Model"),
+                                alt.Tooltip("Agents:Q", format=",", title="Agents using model"),
+                                alt.Tooltip("Agent Share (%):Q", title="Share (%)"),
+                            ],
+                        )
+                        .properties(height=300, title="Mapped agents by model")
+                    )
+                    st.altair_chart(dist_chart, use_container_width=True)
+
 with tab_user_detail:
     st.caption("Drill into a single user: models used, daily credits, hour-of-day patterns, and agent mix.")
     if user_usage_df.empty:
