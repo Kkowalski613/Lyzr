@@ -1,4 +1,5 @@
 from pathlib import Path
+import io
 import json
 
 import altair as alt
@@ -11,6 +12,7 @@ MONTHLY_CREDIT_LIMIT = 12_000
 BURST_THRESHOLD = 10
 CSV_CHUNK_SIZE = 150_000
 MAX_ROWS = 1_000_000
+RAW_EXPORT_LIMIT = 50_000
 
 st.set_page_config(
     page_title="Credit Consumption Dashboard",
@@ -184,6 +186,25 @@ def compute_rank_map(df: pd.DataFrame) -> dict[str, int]:
     )
     grouped["rank"] = grouped.index + 1
     return dict(zip(grouped["User"].str.lower(), grouped["rank"]))
+
+
+def export_to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
+    """
+    Build an Excel workbook from provided sheet name -> dataframe mapping.
+    Large raw sheets are capped to RAW_EXPORT_LIMIT rows to avoid huge files.
+    """
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        for name, df in sheets.items():
+            if df is None or df.empty:
+                continue
+            trimmed = df
+            if len(trimmed) > RAW_EXPORT_LIMIT:
+                trimmed = trimmed.head(RAW_EXPORT_LIMIT)
+            safe_name = name[:31]  # Excel sheet name limit
+            trimmed.to_excel(writer, sheet_name=safe_name, index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def format_rank_change(current_rank: int, previous_rank: int | None) -> str:
@@ -976,6 +997,9 @@ if visible_df.empty:
     st.stop()
 
 model_col, user_col, agent_col = st.columns([1.2, 1.4, 1.2])
+model_df = pd.DataFrame()
+user_df = pd.DataFrame()
+agent_df = pd.DataFrame()
 
 # By model
 with model_col:
@@ -1048,6 +1072,26 @@ if not user_usage_df.empty:
     )
     user_usage_df["Credits per Call"] = user_usage_df["Credits per Call"].round(2)
     user_usage_df["Credits"] = user_usage_df["Credits"].round(2)
+
+daily_all_df = pd.DataFrame()
+if not visible_df.empty:
+    tmp = visible_df.copy()
+    tmp["date"] = tmp["created_at"].dt.date
+    daily_all_df = (
+        tmp.groupby("date")["credits"]
+        .sum()
+        .reset_index()
+        .rename(columns={"credits": "Credits"})
+    )
+    daily_all_df["date"] = pd.to_datetime(daily_all_df["date"])
+
+latency_by_model_df = pd.DataFrame()
+daily_latency_df = pd.DataFrame()
+agent_latency_summary_df = pd.DataFrame()
+kb_df = pd.DataFrame()
+ctx_df = pd.DataFrame()
+mem_df = pd.DataFrame()
+agent_model_distribution_df = pd.DataFrame()
 
 # ---------- Charts & visualizations ----------
 
@@ -1317,6 +1361,7 @@ with tab_latency:
             )
             .reset_index()
         )
+        daily_latency_df = daily_latency.copy()
         daily_latency["date"] = pd.to_datetime(daily_latency["date"])
         latency_long = daily_latency.melt(
             id_vars=["date"],
@@ -1357,6 +1402,7 @@ with tab_latency:
             .rename(columns={"language_model": "Model"})
             .sort_values("p95_latency_ms", ascending=False)
         )
+        latency_by_model_df = latency_by_model.copy()
 
         if latency_by_model.empty:
             st.info("No latency data by model.")
@@ -1621,6 +1667,7 @@ with tab_agent_latency:
                     .reset_index()
                     .sort_values("p95_latency_ms", ascending=False)
                 )
+                agent_latency_summary_df = agent_summary.copy()
                 agent_summary_display = agent_summary.copy()
                 for col in ("avg_latency_ms", "p95_latency_ms"):
                     agent_summary_display[col] = agent_summary_display[col].round(0)
@@ -1631,6 +1678,25 @@ with tab_agent_latency:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+                # Agent latency chart
+                agent_chart_data = agent_summary_display.rename(columns={"agent_name": "Agent"})
+                agent_latency_chart = (
+                    alt.Chart(agent_chart_data)
+                    .mark_bar()
+                    .encode(
+                        y=alt.Y("Agent:N", sort="-x", title="Agent"),
+                        x=alt.X("p95_latency_ms:Q", title="P95 latency (ms)"),
+                        tooltip=[
+                            alt.Tooltip("Agent:N", title="Agent"),
+                            alt.Tooltip("p95_latency_ms:Q", format=",.0f", title="P95 latency (ms)"),
+                            alt.Tooltip("avg_latency_ms:Q", format=",.0f", title="Avg latency (ms)"),
+                            alt.Tooltip("samples:Q", format=",", title="Samples"),
+                        ],
+                    )
+                    .properties(height=320, title="P95 latency by agent")
+                )
+                st.altair_chart(agent_latency_chart, use_container_width=True)
 
                 def summarize_flag(df: pd.DataFrame, flag_col: str, label: str) -> pd.DataFrame:
                     grouped = (
@@ -1683,6 +1749,67 @@ with tab_agent_latency:
                     st.markdown("###### Memory")
                     render_flag_chart(mem_df, "Memory")
 
+                # Time-of-day latency (hourly)
+                st.markdown("##### Hour-of-day latency (all mapped agents)")
+                agent_latency["hour"] = agent_latency["created_at"].dt.hour
+                hourly_latency = (
+                    agent_latency.groupby("hour")["latency_ms"]
+                    .agg(
+                        avg_latency_ms="mean",
+                        p95_latency_ms=lambda s: s.quantile(0.95),
+                        samples="count",
+                    )
+                    .reset_index()
+                    .sort_values("hour")
+                )
+                hourly_chart = (
+                    alt.Chart(hourly_latency)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("hour:O", title="Hour of day"),
+                        y=alt.Y("p95_latency_ms:Q", title="P95 latency (ms)"),
+                        tooltip=[
+                            alt.Tooltip("hour:O", title="Hour"),
+                            alt.Tooltip("p95_latency_ms:Q", format=",.0f", title="P95 latency (ms)"),
+                            alt.Tooltip("avg_latency_ms:Q", format=",.0f", title="Avg latency (ms)"),
+                            alt.Tooltip("samples:Q", format=",", title="Samples"),
+                        ],
+                    )
+                    .properties(height=240, title="P95 latency by hour")
+                )
+                st.altair_chart(hourly_chart, use_container_width=True)
+
+                # Minute-level granularity (rounded to minute; capped for chart size)
+                st.markdown("##### Minute-level latency (rounded to minute)")
+                agent_latency["minute_key"] = agent_latency["created_at"].dt.floor("T")
+                minute_latency = (
+                    agent_latency.groupby("minute_key")["latency_ms"]
+                    .agg(
+                        avg_latency_ms="mean",
+                        p95_latency_ms=lambda s: s.quantile(0.95),
+                        samples="count",
+                    )
+                    .reset_index()
+                    .sort_values("minute_key")
+                )
+                minute_latency_cap = minute_latency.tail(500)  # avoid over-plotting
+                minute_chart = (
+                    alt.Chart(minute_latency_cap)
+                    .mark_line()
+                    .encode(
+                        x=alt.X("minute_key:T", title="Time (minute)"),
+                        y=alt.Y("p95_latency_ms:Q", title="P95 latency (ms)"),
+                        tooltip=[
+                            alt.Tooltip("minute_key:T", title="Minute"),
+                            alt.Tooltip("p95_latency_ms:Q", format=",.0f", title="P95 latency (ms)"),
+                            alt.Tooltip("avg_latency_ms:Q", format=",.0f", title="Avg latency (ms)"),
+                            alt.Tooltip("samples:Q", format=",", title="Samples"),
+                        ],
+                    )
+                    .properties(height=240, title="Recent 500 minutes (P95)")
+                )
+                st.altair_chart(minute_chart, use_container_width=True)
+
                 st.markdown("##### Model distribution across mapped agents")
                 model_agents = visible_enriched_df[visible_enriched_df["agent_name"] != ""].copy()
                 model_agents = model_agents[model_agents["language_model"].notna()]
@@ -1702,6 +1829,7 @@ with tab_agent_latency:
                     model_distribution["Agent Share (%)"] = (
                         model_distribution["Agents"] / total_mapped_agents * 100
                     ).round(1)
+                    agent_model_distribution_df = model_distribution.copy()
 
                     st.dataframe(model_distribution, use_container_width=True, hide_index=True)
 
@@ -1853,6 +1981,37 @@ with tab_user_detail:
                 agent_usage["Credits"] = agent_usage["Credits"].round(2)
                 st.markdown("##### Agent usage (if mapped)")
                 st.dataframe(agent_usage, use_container_width=True, hide_index=True)
+
+export_sheets = {
+    "model_breakdown": model_df,
+    "user_breakdown": user_df,
+    "agent_breakdown": agent_df,
+    "daily_credits": daily_all_df,
+    "monthly_usage": monthly_usage_df,
+    "latency_daily": daily_latency_df,
+    "latency_by_model": latency_by_model_df,
+    "agent_latency": agent_latency_summary_df,
+    "agent_latency_kb": kb_df,
+    "agent_latency_context": ctx_df,
+    "agent_latency_memory": mem_df,
+    "agent_model_distribution": agent_model_distribution_df,
+    "user_usage": user_usage_df,
+}
+if not visible_df.empty:
+    export_sheets["filtered_rows"] = visible_df.head(RAW_EXPORT_LIMIT)
+
+export_data_available = any(df is not None and not df.empty for df in export_sheets.values())
+if export_data_available:
+    excel_bytes = export_to_excel(export_sheets)
+    st.download_button(
+        "📥 Download Excel (all views)",
+        data=excel_bytes,
+        file_name=f"credit_dashboard_{selected_period}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Exports key tables for this period. Raw rows capped at 50k to keep file size reasonable.",
+    )
+else:
+    st.caption("Nothing to export yet; load data first.")
 
 st.markdown("---")
 st.markdown(
