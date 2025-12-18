@@ -711,6 +711,15 @@ with st.sidebar:
     if local_agent_file is not None and agent_file is None:
         st.caption(f"Using local agent JSON: {local_agent_file.name}")
 
+    max_rows_setting = st.number_input(
+        "Max rows to load (for large CSVs)",
+        min_value=50_000,
+        max_value=2_000_000,
+        value=MAX_ROWS,
+        step=50_000,
+        help="Files larger than this limit will be truncated to protect memory. Lower this if uploads crash; raise cautiously if you have RAM.",
+    )
+
     st.markdown(
         """
         <div class="small-text">
@@ -729,7 +738,7 @@ if uploaded_file is None:
 # ---------- Load & clean ----------
 
 with st.spinner("Loading file (chunked for large CSVs)..."):
-    raw_df, total_rows, truncated = load_usage_data(uploaded_file)
+    raw_df, total_rows, truncated = load_usage_data(uploaded_file, max_rows=int(max_rows_setting))
 
 if raw_df.empty:
     st.error("Could not read any rows from the uploaded file.")
@@ -740,7 +749,7 @@ clean_df = clean_dataframe(raw_df)
 clean_rows = len(clean_df)
 dropped_rows = total_rows - clean_rows
 if truncated:
-    st.warning(f"Large file truncated to first {total_rows:,} rows for performance (max {MAX_ROWS:,}).")
+    st.warning(f"Large file truncated to first {total_rows:,} rows for performance (max {int(max_rows_setting):,}). Lower the limit if it still crashes, or convert to CSV if using Excel.")
 
 if clean_df.empty:
     st.error("No valid rows after cleaning. Check that the CSV uses the expected columns.")
