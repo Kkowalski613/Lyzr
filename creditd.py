@@ -288,7 +288,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[df["email"].str.lower().isin(bad_email_values), "email"] = "(no email)"
 
     # 7) Agent ID normalization
-    df["agent_id"] = df["agent_id"].astype(str).str.strip()
+    df["agent_id"] = df["agent_id"].astype(str).str.strip().str.lower()
     bad_agent_values = {"", "nan", "NaN", "none", "None", "null", "Null"}
     df.loc[df["agent_id"].str.lower().isin(bad_agent_values), "agent_id"] = "(unassigned)"
 
@@ -421,7 +421,7 @@ def load_agent_metadata(uploaded_json) -> pd.DataFrame:
         }
         rows.append(
             {
-                "agent_id": agent_id,
+                "agent_id": agent_id.lower(),
                 "agent_name": str(item.get("name", "")).strip(),
                 "has_kb": "knowledge_base" in feature_types,
                 "uses_context": "context" in feature_types,
@@ -433,7 +433,7 @@ def load_agent_metadata(uploaded_json) -> pd.DataFrame:
         return pd.DataFrame()
 
     agents_df = pd.DataFrame(rows)
-    agents_df["agent_id"] = agents_df["agent_id"].astype(str).str.strip()
+    agents_df["agent_id"] = agents_df["agent_id"].astype(str).str.strip().str.lower()
     for col in ("has_kb", "uses_context", "uses_memory"):
         agents_df[col] = agents_df[col].fillna(False)
     return agents_df.drop_duplicates("agent_id")
@@ -646,10 +646,10 @@ def enrich_with_agents(df: pd.DataFrame, agents_df: pd.DataFrame) -> pd.DataFram
         return result
 
     lookup = agents_df.drop_duplicates("agent_id").set_index("agent_id")
-    result["agent_name"] = result["agent_id"].map(lookup["agent_name"]).fillna("")
-    result["has_kb"] = result["agent_id"].map(lookup["has_kb"]).fillna(False)
-    result["uses_context"] = result["agent_id"].map(lookup["uses_context"]).fillna(False)
-    result["uses_memory"] = result["agent_id"].map(lookup["uses_memory"]).fillna(False)
+    result["agent_name"] = result["agent_id"].str.lower().map(lookup["agent_name"]).fillna("")
+    result["has_kb"] = result["agent_id"].str.lower().map(lookup["has_kb"]).fillna(False)
+    result["uses_context"] = result["agent_id"].str.lower().map(lookup["uses_context"]).fillna(False)
+    result["uses_memory"] = result["agent_id"].str.lower().map(lookup["uses_memory"]).fillna(False)
     return result
 
 
@@ -790,6 +790,8 @@ agents_df = load_agent_metadata(agent_file)
 agents_available = not agents_df.empty
 if agent_file is not None and agents_df.empty:
     st.info("AgentID Names.json not provided or unreadable. Agent metadata is skipped.")
+elif agents_available:
+    st.caption(f"Loaded {len(agents_df):,} agent records; IDs normalized to lowercase for matching.")
 
 # Monthly consumption pattern (for projections & charts)
 monthly_base = clean_df.copy()
@@ -884,6 +886,8 @@ period_label_short = {"Monthly": "Month", "Weekly": "Week", "Daily": "Day"}[time
 total_credits_visible = visible_df["credits"].sum()
 total_calls_visible = len(visible_df)
 active_users = visible_df[visible_df["email"] != "(no email)"]["email"].nunique()
+mapped_agents = visible_enriched_df[(visible_enriched_df["agent_id"] != "(unassigned)") & (visible_enriched_df["agent_name"] != "")]
+total_agents_present = visible_enriched_df[visible_enriched_df["agent_id"] != "(unassigned)"]["agent_id"].nunique()
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -926,6 +930,11 @@ with col4:
     st.markdown(
         '<div class="metric-subtitle">Computed on full period, regardless of toggle</div>',
         unsafe_allow_html=True,
+    )
+
+if agents_available and total_agents_present > 0:
+    st.caption(
+        f"Agent mapping: {mapped_agents['agent_id'].nunique():,} of {total_agents_present:,} agent IDs matched to names."
     )
 
 latency_samples = visible_df["latency_ms"].dropna() if "latency_ms" in visible_df.columns else pd.Series(dtype="float")
