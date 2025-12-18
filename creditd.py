@@ -9,6 +9,8 @@ import streamlit as st
 TOTAL_ANNUAL_CREDITS = 250_000
 MONTHLY_CREDIT_LIMIT = 12_000
 BURST_THRESHOLD = 10
+CSV_CHUNK_SIZE = 150_000
+MAX_ROWS = 1_000_000
 
 st.set_page_config(
     page_title="Credit Consumption Dashboard",
@@ -416,6 +418,51 @@ def load_agent_metadata(uploaded_json) -> pd.DataFrame:
     return agents_df.drop_duplicates("agent_id")
 
 
+def load_usage_data(uploaded_file, chunksize: int = CSV_CHUNK_SIZE, max_rows: int = MAX_ROWS) -> tuple[pd.DataFrame, int, bool]:
+    """
+    Load the main usage file with chunking to avoid memory blow-ups.
+    Supports CSV (preferred) and Excel fallback. Returns (df, rows_read, truncated_flag).
+    """
+    if uploaded_file is None:
+        return pd.DataFrame(), 0, False
+
+    name = (uploaded_file.name or "").lower()
+    truncated = False
+
+    if name.endswith(".csv"):
+        chunks = []
+        rows = 0
+        try:
+            for chunk in pd.read_csv(uploaded_file, chunksize=chunksize):
+                chunks.append(chunk)
+                rows += len(chunk)
+                if rows >= max_rows:
+                    truncated = True
+                    break
+        except Exception as exc:
+            st.error(f"Could not read CSV: {exc}")
+            return pd.DataFrame(), 0, False
+
+        if not chunks:
+            return pd.DataFrame(), 0, False
+
+        df = pd.concat(chunks, ignore_index=True)
+        if truncated:
+            df = df.head(max_rows)
+        return df, len(df), truncated
+
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        try:
+            df = pd.read_excel(uploaded_file)
+            return df, len(df), False
+        except Exception as exc:
+            st.error(f"Could not read Excel. Convert to CSV for better performance. Error: {exc}")
+            return pd.DataFrame(), 0, False
+
+    st.error("Unsupported file type. Please upload a CSV (preferred) or Excel file.")
+    return pd.DataFrame(), 0, False
+
+
 def model_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -681,12 +728,19 @@ if uploaded_file is None:
 
 # ---------- Load & clean ----------
 
-raw_df = pd.read_csv(uploaded_file)
+with st.spinner("Loading file (chunked for large CSVs)..."):
+    raw_df, total_rows, truncated = load_usage_data(uploaded_file)
+
+if raw_df.empty:
+    st.error("Could not read any rows from the uploaded file.")
+    st.stop()
+
 clean_df = clean_dataframe(raw_df)
 
-total_rows = len(raw_df)
 clean_rows = len(clean_df)
 dropped_rows = total_rows - clean_rows
+if truncated:
+    st.warning(f"Large file truncated to first {total_rows:,} rows for performance (max {MAX_ROWS:,}).")
 
 if clean_df.empty:
     st.error("No valid rows after cleaning. Check that the CSV uses the expected columns.")
