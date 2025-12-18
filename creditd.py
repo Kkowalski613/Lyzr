@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import altair as alt
 import numpy as np
@@ -341,6 +342,80 @@ def load_roles_mapping(uploaded_roles) -> pd.DataFrame:
     return roles_df[["email", "role", "discipline", "office"]]
 
 
+def find_local_agent_file() -> Path | None:
+    """
+    Locate a local AgentID Names JSON, favoring common spellings.
+    """
+    candidates = [
+        Path("AgentID Names.json"),
+        Path("AgentID Names.JSON"),
+        Path("agentid names.json"),
+        Path("AgentID_Names.json"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_agent_metadata(uploaded_json) -> pd.DataFrame:
+    """
+    Load the AgentID Names JSON (uploaded or local) to map agent_id -> name/features.
+    Expected fields: _id/agent_id/id, name, features (list with type keys).
+    """
+    local_agents = find_local_agent_file()
+    source = uploaded_json if uploaded_json is not None else local_agents
+    source_label = getattr(uploaded_json, "name", None) if uploaded_json is not None else (local_agents.name if local_agents else None)
+
+    if source is None:
+        return pd.DataFrame()
+
+    try:
+        if hasattr(source, "read"):  # uploaded file-like
+            data = json.load(source)
+        else:
+            with open(source, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+    except Exception as exc:  # pragma: no cover - UI warning
+        label = source_label or "AgentID Names.json"
+        st.warning(f"Could not read {label}: {exc}")
+        return pd.DataFrame()
+
+    rows = []
+    records = data if isinstance(data, list) else []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("_id") or item.get("agent_id") or item.get("id") or ""
+        agent_id = str(raw_id).strip()
+        if agent_id == "":
+            continue
+        feature_list = item.get("features") or []
+        feature_types = {
+            str(f.get("type", "")).strip().lower()
+            for f in feature_list
+            if isinstance(f, dict) and "type" in f
+        }
+        rows.append(
+            {
+                "agent_id": agent_id,
+                "agent_name": str(item.get("name", "")).strip(),
+                "has_kb": "knowledge_base" in feature_types,
+                "uses_context": "context" in feature_types,
+                "uses_memory": "memory" in feature_types,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    agents_df = pd.DataFrame(rows)
+    agents_df["agent_id"] = agents_df["agent_id"].astype(str).str.strip()
+    for col in ("has_kb", "uses_context", "uses_memory"):
+        agents_df[col] = agents_df[col].fillna(False)
+    return agents_df.drop_duplicates("agent_id")
+
+
 def model_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -482,6 +557,29 @@ def enrich_with_roles(df: pd.DataFrame, roles_df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def enrich_with_agents(df: pd.DataFrame, agents_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attach agent metadata (name, feature flags) by agent_id.
+    """
+    if df.empty:
+        return df.copy()
+
+    result = df.copy()
+    for col in ("agent_name", "has_kb", "uses_context", "uses_memory"):
+        if col not in result.columns:
+            result[col] = "" if col == "agent_name" else False
+
+    if agents_df is None or agents_df.empty:
+        return result
+
+    lookup = agents_df.drop_duplicates("agent_id").set_index("agent_id")
+    result["agent_name"] = result["agent_id"].map(lookup["agent_name"]).fillna("")
+    result["has_kb"] = result["agent_id"].map(lookup["has_kb"]).fillna(False)
+    result["uses_context"] = result["agent_id"].map(lookup["uses_context"]).fillna(False)
+    result["uses_memory"] = result["agent_id"].map(lookup["uses_memory"]).fillna(False)
+    return result
+
+
 def style_user_dataframe(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
     """
     Highlight users exceeding the monthly allotment in red for quick scanning.
@@ -557,6 +655,15 @@ with st.sidebar:
     if local_roles_path is not None and roles_file is None:
         st.caption(f"Using local roles workbook: {local_roles_path.name}")
 
+    local_agent_file = find_local_agent_file()
+    agent_file = st.file_uploader(
+        "Upload AgentID Names.json (optional)",
+        type=["json"],
+        help="Maps agent_id to agent name and features (knowledge base, context, memory).",
+    )
+    if local_agent_file is not None and agent_file is None:
+        st.caption(f"Using local agent JSON: {local_agent_file.name}")
+
     st.markdown(
         """
         <div class="small-text">
@@ -589,6 +696,11 @@ roles_df = load_roles_mapping(roles_file)
 roles_available = show_roles and not roles_df.empty
 if show_roles and roles_df.empty:
     st.info("Prophet roles.xlsx not provided or unreadable. Role enrichment is skipped.")
+
+agents_df = load_agent_metadata(agent_file)
+agents_available = not agents_df.empty
+if agent_file is not None and agents_df.empty:
+    st.info("AgentID Names.json not provided or unreadable. Agent metadata is skipped.")
 
 # Monthly consumption pattern (for projections & charts)
 monthly_base = clean_df.copy()
@@ -669,6 +781,7 @@ else:
 previous_ranks = compute_rank_map(previous_visible_df)
 burst_users = detect_burst_users(visible_df, threshold=BURST_THRESHOLD)
 visible_enriched_df = enrich_with_roles(visible_df, roles_df)
+visible_enriched_df = enrich_with_agents(visible_enriched_df, agents_df)
 
 # Embedding share is *always* computed on the full period
 embeddings_df = period_slice[period_slice["call_type"] == "aembedding"]
@@ -878,8 +991,8 @@ if not user_usage_df.empty:
 st.markdown("---")
 st.subheader("Visualizations")
 
-tab_org, tab_activity, tab_allotment, tab_user_usage, tab_latency, tab_daily_users, tab_latency_deep = st.tabs(
-    ["Org Usage", "User Activity", "Credit Allotment", "User Usage", "Latency", "Daily Credits", "Latency Deep Dive"]
+tab_org, tab_activity, tab_allotment, tab_user_usage, tab_latency, tab_daily_users, tab_latency_deep, tab_agent_latency, tab_user_detail = st.tabs(
+    ["Org Usage", "User Activity", "Credit Allotment", "User Usage", "Latency", "Daily Credits", "Latency Deep Dive", "Agent Latency", "User Detail"]
 )
 
 with tab_org:
@@ -1416,6 +1529,229 @@ with tab_latency_deep:
                 .properties(height=320, title="Latency by office (P95)")
             )
             st.altair_chart(office_chart, use_container_width=True)
+
+with tab_agent_latency:
+    st.caption("Latency by agent features (only agents mapped from AgentID Names.json).")
+    if not agents_available:
+        st.info("Upload AgentID Names.json to view agent-level latency.")
+    else:
+        if "latency_ms" not in visible_enriched_df.columns:
+            st.info("Latency data not found in this export.")
+        else:
+            agent_latency = visible_enriched_df.dropna(subset=["latency_ms"]).copy()
+            agent_latency = agent_latency[agent_latency["agent_name"] != ""]
+
+            if agent_latency.empty:
+                st.info("No latency rows for agents present in AgentID Names.json.")
+            else:
+                agent_latency["latency_ms"] = pd.to_numeric(agent_latency["latency_ms"], errors="coerce")
+                agent_latency = agent_latency.dropna(subset=["latency_ms"])
+
+                agent_summary = (
+                    agent_latency
+                    .groupby(["agent_name", "agent_id", "has_kb", "uses_context", "uses_memory"])["latency_ms"]
+                    .agg(
+                        avg_latency_ms="mean",
+                        p95_latency_ms=lambda s: s.quantile(0.95),
+                        samples="count",
+                    )
+                    .reset_index()
+                    .sort_values("p95_latency_ms", ascending=False)
+                )
+                agent_summary_display = agent_summary.copy()
+                for col in ("avg_latency_ms", "p95_latency_ms"):
+                    agent_summary_display[col] = agent_summary_display[col].round(0)
+
+                st.markdown("##### Latency by mapped agent")
+                st.dataframe(
+                    agent_summary_display.rename(columns={"agent_name": "Agent", "agent_id": "Agent ID"}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                def summarize_flag(df: pd.DataFrame, flag_col: str, label: str) -> pd.DataFrame:
+                    grouped = (
+                        df.groupby(flag_col)["latency_ms"]
+                        .agg(
+                            avg_latency_ms="mean",
+                            p95_latency_ms=lambda s: s.quantile(0.95),
+                            samples="count",
+                        )
+                        .reset_index()
+                    )
+                    grouped[flag_col] = grouped[flag_col].map({True: f"{label}: Yes", False: f"{label}: No"})
+                    for col in ("avg_latency_ms", "p95_latency_ms"):
+                        grouped[col] = grouped[col].round(0)
+                    return grouped
+
+                def render_flag_chart(df: pd.DataFrame, x_label: str):
+                    if df.empty:
+                        st.info(f"No latency data for {x_label.lower()}.")
+                        return
+                    chart = (
+                        alt.Chart(df)
+                        .mark_bar()
+                        .encode(
+                            y=alt.Y(df.columns[0] + ":N", sort="-x", title=x_label),
+                            x=alt.X("p95_latency_ms:Q", title="P95 latency (ms)"),
+                            tooltip=[
+                                alt.Tooltip(df.columns[0] + ":N", title=x_label),
+                                alt.Tooltip("p95_latency_ms:Q", format=",.0f", title="P95 latency (ms)"),
+                                alt.Tooltip("avg_latency_ms:Q", format=",.0f", title="Avg latency (ms)"),
+                                alt.Tooltip("samples:Q", format=",", title="Samples"),
+                            ],
+                        )
+                        .properties(height=200)
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+
+                flag_col1, flag_col2, flag_col3 = st.columns(3)
+                kb_df = summarize_flag(agent_latency, "has_kb", "Knowledge Base")
+                ctx_df = summarize_flag(agent_latency, "uses_context", "Context")
+                mem_df = summarize_flag(agent_latency, "uses_memory", "Memory")
+
+                with flag_col1:
+                    st.markdown("###### Knowledge base")
+                    render_flag_chart(kb_df, "Knowledge base")
+                with flag_col2:
+                    st.markdown("###### Context")
+                    render_flag_chart(ctx_df, "Context")
+                with flag_col3:
+                    st.markdown("###### Memory")
+                    render_flag_chart(mem_df, "Memory")
+
+with tab_user_detail:
+    st.caption("Drill into a single user: models used, daily credits, hour-of-day patterns, and agent mix.")
+    if user_usage_df.empty:
+        st.info("No user data available for this period.")
+    else:
+        user_options = user_usage_df["User"].tolist()
+        selected_user = st.selectbox(
+            "Select user",
+            options=user_options,
+            index=0,
+        )
+
+        user_df = visible_enriched_df[
+            visible_enriched_df["email"].str.lower() == selected_user.strip().lower()
+        ].copy()
+
+        if user_df.empty:
+            st.info("No rows found for this user in the selected period.")
+        else:
+            total_credits_user = user_df["credits"].sum()
+            total_calls_user = len(user_df)
+            credits_per_call_user = (total_credits_user / total_calls_user) if total_calls_user > 0 else np.nan
+
+            user_latency = user_df["latency_ms"].dropna() if "latency_ms" in user_df.columns else pd.Series(dtype="float")
+            col_u1, col_u2, col_u3, col_u4 = st.columns(4)
+            with col_u1:
+                st.metric("Credits", f"{total_credits_user:,.2f}")
+            with col_u2:
+                st.metric("Calls", f"{total_calls_user:,}")
+            with col_u3:
+                st.metric("Credits per Call", f"{credits_per_call_user:,.2f}" if pd.notna(credits_per_call_user) else "—")
+            with col_u4:
+                if user_latency.empty:
+                    st.metric("P95 Latency", "—")
+                else:
+                    st.metric("P95 Latency", f"{user_latency.quantile(0.95):,.0f} ms")
+
+            # Models used
+            model_usage = (
+                user_df.groupby("language_model")
+                .agg(
+                    Calls=("language_model", "size"),
+                    Credits=("credits", "sum"),
+                    Avg_Latency_ms=("latency_ms", "mean"),
+                )
+                .reset_index()
+                .rename(columns={"language_model": "Model"})
+                .sort_values("Credits", ascending=False)
+            )
+            model_usage["Credits"] = model_usage["Credits"].round(2)
+            if "Avg_Latency_ms" in model_usage.columns:
+                model_usage["Avg_Latency_ms"] = model_usage["Avg_Latency_ms"].round(0)
+
+            st.markdown("##### Models used")
+            st.dataframe(model_usage, use_container_width=True, hide_index=True)
+
+            # Daily credits
+            st.markdown("##### Daily credits")
+            user_df["date"] = user_df["created_at"].dt.date
+            daily_user = (
+                user_df.groupby("date")["credits"]
+                .sum()
+                .reset_index()
+                .rename(columns={"credits": "Credits"})
+            )
+            daily_user["date"] = pd.to_datetime(daily_user["date"])
+            daily_chart = (
+                alt.Chart(daily_user)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y("Credits:Q", title="Credits"),
+                    tooltip=[
+                        alt.Tooltip("date:T", title="Date"),
+                        alt.Tooltip("Credits:Q", format=",", title="Credits"),
+                    ],
+                )
+                .properties(height=260, title="Daily credits")
+            )
+            st.altair_chart(daily_chart, use_container_width=True)
+
+            # Hour-of-day habits
+            st.markdown("##### Hour-of-day pattern")
+            user_df["hour"] = user_df["created_at"].dt.hour
+            hour_usage = (
+                user_df.groupby("hour")["credits"]
+                .sum()
+                .reset_index()
+                .rename(columns={"credits": "Credits"})
+            )
+            hour_chart = (
+                alt.Chart(hour_usage)
+                .mark_bar()
+                .encode(
+                    x=alt.X("hour:O", title="Hour of day"),
+                    y=alt.Y("Credits:Q", title="Credits"),
+                    tooltip=[
+                        alt.Tooltip("hour:O", title="Hour"),
+                        alt.Tooltip("Credits:Q", format=",", title="Credits"),
+                    ],
+                )
+                .properties(height=200, title="Credits by hour")
+            )
+            st.altair_chart(hour_chart, use_container_width=True)
+
+            # Call type / embeddings share
+            st.markdown("##### Call type mix")
+            call_mix = (
+                user_df.groupby("call_type")["credits"]
+                .sum()
+                .reset_index()
+                .rename(columns={"call_type": "Call Type", "credits": "Credits"})
+                .sort_values("Credits", ascending=False)
+            )
+            call_mix["Credits"] = call_mix["Credits"].round(2)
+            st.dataframe(call_mix, use_container_width=True, hide_index=True)
+
+            # Agent usage when available
+            if "agent_id" in user_df.columns:
+                agent_usage = (
+                    user_df.groupby(["agent_id", "agent_name"])
+                    .agg(
+                        Calls=("agent_id", "size"),
+                        Credits=("credits", "sum"),
+                    )
+                    .reset_index()
+                    .rename(columns={"agent_id": "Agent ID", "agent_name": "Agent"})
+                    .sort_values("Credits", ascending=False)
+                )
+                agent_usage["Credits"] = agent_usage["Credits"].round(2)
+                st.markdown("##### Agent usage (if mapped)")
+                st.dataframe(agent_usage, use_container_width=True, hide_index=True)
 
 st.markdown("---")
 st.markdown(
