@@ -591,16 +591,17 @@ def agent_breakdown(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     grouped = (
-        df.groupby("agent_id", dropna=False)
+        df.groupby(["agent_id", "agent_name"], dropna=False)
           .agg(
               Calls=("agent_id", "size"),
               Credits=("credits", "sum"),
           )
           .reset_index()
-          .rename(columns={"agent_id": "Agent ID"})
+          .rename(columns={"agent_id": "Agent ID", "agent_name": "Agent Name"})
     )
     grouped["Credits"] = grouped["Credits"].round(2)
     grouped = grouped.sort_values("Credits", ascending=False)
+    grouped["Agent Name"] = grouped["Agent Name"].fillna("").replace({"nan": ""})
     return grouped
 
 
