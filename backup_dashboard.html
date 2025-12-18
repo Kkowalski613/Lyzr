@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Credit Dashboard (Browser Backup)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f7f7fb; color: #111; }
+    h1 { margin-bottom: 0.25rem; }
+    .card { background: #fff; padding: 16px; margin: 10px 0; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; }
+    .col { flex: 1 1 320px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid #e5e7eb; text-align: left; }
+    th { background: #f1f5f9; }
+    .metric { font-size: 1.4rem; font-weight: 700; }
+    .muted { color: #6b7280; font-size: 0.9rem; }
+    .btn { padding: 10px 12px; border: none; background: #2563eb; color: #fff; border-radius: 6px; cursor: pointer; }
+    .btn:disabled { background: #9ca3af; cursor: not-allowed; }
+    canvas { background: #fff; border-radius: 8px; padding: 10px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <h1>Credit Consumption Dashboard (Browser Backup)</h1>
+  <p class="muted">Runs fully in your browser. Upload your CSV/Excel export plus optional roles.xlsx and AgentID Names.json. Large files may still stress the browser, so keep them reasonable.</p>
+
+  <div class="card">
+    <div class="row">
+      <div class="col">
+        <label><strong>Main export (CSV preferred, Excel allowed):</strong></label><br />
+        <input type="file" id="file-main" accept=".csv,.xls,.xlsx" />
+      </div>
+      <div class="col">
+        <label><strong>Roles workbook (optional, xlsx):</strong></label><br />
+        <input type="file" id="file-roles" accept=".xls,.xlsx" />
+      </div>
+      <div class="col">
+        <label><strong>AgentID Names.json (optional):</strong></label><br />
+        <input type="file" id="file-agents" accept=".json" />
+      </div>
+      <div class="col">
+        <label><strong>Max rows to load:</strong></label><br />
+        <input type="number" id="max-rows" value="400000" min="50000" max="2000000" step="50000" />
+      </div>
+    </div>
+    <div style="margin-top:12px;">
+      <button class="btn" id="btn-process">Process</button>
+      <button class="btn" id="btn-download" disabled>Download Excel (chart data)</button>
+      <span id="status" class="muted" style="margin-left:10px;"></span>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col card">
+      <div class="metric" id="m-credits">—</div>
+      <div class="muted">Total credits</div>
+    </div>
+    <div class="col card">
+      <div class="metric" id="m-calls">—</div>
+      <div class="muted">Total calls</div>
+    </div>
+    <div class="col card">
+      <div class="metric" id="m-users">—</div>
+      <div class="muted">Active users</div>
+    </div>
+    <div class="col card">
+      <div class="metric" id="m-models">—</div>
+      <div class="muted">Models used</div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col card">
+      <h3>Model distribution (credits)</h3>
+      <canvas id="chart-models" height="220"></canvas>
+    </div>
+    <div class="col card">
+      <h3>User leaderboard (credits)</h3>
+      <table id="tbl-users"></table>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col card">
+      <h3>Daily credits (all users)</h3>
+      <canvas id="chart-daily" height="200"></canvas>
+    </div>
+    <div class="col card">
+      <h3>Agent model distribution (mapped agents)</h3>
+      <canvas id="chart-agent-models" height="200"></canvas>
+      <div class="muted" id="agent-note"></div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      rows: [],
+      roles: {},
+      agents: {},
+      charts: {},
+      tables: {},
+      aggregates: {}
+    };
+
+    const requiredCols = ["log_id","agent_id","call_type","language_model","email","actions","created_at"];
+
+    function setStatus(msg) {
+      document.getElementById("status").textContent = msg || "";
+    }
+
+    function formatNumber(num) {
+      if (num === null || num === undefined || isNaN(num)) return "—";
+      return Number(num).toLocaleString();
+    }
+
+    function parseDate(val) {
+      const d = new Date(val);
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    function normalizeRow(row) {
+      const out = {};
+      for (const key of Object.keys(row)) {
+        const norm = key.toLowerCase().trim();
+        out[norm] = row[key];
+      }
+      return out;
+    }
+
+    function cleanRows(raw, maxRows) {
+      const result = [];
+      for (const r of raw) {
+        const row = normalizeRow(r);
+        if (!requiredCols.every(c => c in row)) continue;
+        const logId = String(row["log_id"] || "").trim();
+        if (!logId || logId.toLowerCase() === "nan" || logId.length < 8) continue;
+        const credits = Number(row["actions"]);
+        if (!isFinite(credits) || credits <= 0) continue;
+        const callType = String(row["call_type"] || "").trim();
+        const model = String(row["language_model"] || "").trim();
+        if (!callType || !model) continue;
+        const created = parseDate(row["created_at"]);
+        if (!created) continue;
+        const email = String(row["email"] || "").trim().toLowerCase() || "(no email)";
+        const agentId = String(row["agent_id"] || "").trim();
+        const latency = row["latency_ms"] !== undefined ? Number(row["latency_ms"]) : null;
+        result.push({
+          log_id: logId,
+          agent_id: agentId,
+          call_type: callType,
+          language_model: model,
+          email,
+          credits,
+          created_at: created,
+          date_key: created.toISOString().slice(0,10),
+          latency_ms: isFinite(latency) ? latency : null
+        });
+        if (result.length >= maxRows) break;
+      }
+      return result;
+    }
+
+    function groupBy(arr, keyFn) {
+      const map = new Map();
+      for (const item of arr) {
+        const key = keyFn(item);
+        map.set(key, (map.get(key) || []).concat([item]));
+      }
+      return map;
+    }
+
+    function sumCredits(items) {
+      return items.reduce((acc, r) => acc + (r.credits || 0), 0);
+    }
+
+    function renderMetrics(rows) {
+      const totalCredits = sumCredits(rows);
+      document.getElementById("m-credits").textContent = formatNumber(totalCredits.toFixed(2));
+      document.getElementById("m-calls").textContent = formatNumber(rows.length);
+      const users = new Set(rows.map(r => r.email).filter(e => e && e !== "(no email)"));
+      document.getElementById("m-users").textContent = formatNumber(users.size);
+      const models = new Set(rows.map(r => r.language_model));
+      document.getElementById("m-models").textContent = formatNumber(models.size);
+    }
+
+    function renderModelChart(rows) {
+      const grouped = groupBy(rows, r => r.language_model);
+      const labels = [];
+      const data = [];
+      grouped.forEach((items, model) => {
+        labels.push(model);
+        data.push(sumCredits(items));
+      });
+      const ctx = document.getElementById("chart-models");
+      state.charts.models && state.charts.models.destroy();
+      state.charts.models = new Chart(ctx, {
+        type: "bar",
+        data: { labels, datasets: [{ label: "Credits", data, backgroundColor: "#2563eb" }] },
+        options: { responsive: true, plugins: { legend: { display: false } } }
+      });
+      state.aggregates.model_distribution = labels.map((m,i)=>({Model:m, Credits:data[i]}));
+    }
+
+    function renderUsers(rows) {
+      const grouped = groupBy(rows.filter(r => r.email && r.email !== "(no email)"), r => r.email);
+      const users = [];
+      grouped.forEach((items, email) => {
+        users.push({ User: email, Credits: sumCredits(items), Calls: items.length });
+      });
+      users.sort((a,b)=> b.Credits - a.Credits);
+      const top = users.slice(0, 20);
+      const tbl = document.getElementById("tbl-users");
+      tbl.innerHTML = "<tr><th>#</th><th>User</th><th>Credits</th><th>Calls</th></tr>";
+      top.forEach((u, idx) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${idx+1}</td><td>${u.User}</td><td>${u.Credits.toFixed(2)}</td><td>${u.Calls}</td>`;
+        tbl.appendChild(tr);
+      });
+      state.aggregates.user_leaderboard = users;
+    }
+
+    function renderDailyChart(rows) {
+      const grouped = groupBy(rows, r => r.date_key);
+      const labels = [];
+      const data = [];
+      Array.from(grouped.keys()).sort().forEach(date => {
+        labels.push(date);
+        data.push(sumCredits(grouped.get(date)));
+      });
+      const ctx = document.getElementById("chart-daily");
+      state.charts.daily && state.charts.daily.destroy();
+      state.charts.daily = new Chart(ctx, {
+        type: "line",
+        data: { labels, datasets: [{ label: "Credits", data, borderColor: "#22c55e", tension: 0.2 }] },
+        options: { responsive: true, plugins: { legend: { display: false } } }
+      });
+      state.aggregates.daily_credits = labels.map((d,i)=>({Date:d, Credits:data[i]}));
+    }
+
+    function renderAgentModelChart(rows, agentMap) {
+      const mapped = rows.filter(r => r.agent_id && agentMap[r.agent_id]);
+      const note = document.getElementById("agent-note");
+      if (!mapped.length) {
+        note.textContent = "No mapped agents found in this data.";
+        const ctx = document.getElementById("chart-agent-models");
+        ctx.getContext("2d").clearRect(0,0,ctx.width,ctx.height);
+        state.aggregates.agent_model_dist = [];
+        return;
+      }
+      note.textContent = `Mapped agents: ${new Set(mapped.map(r=>r.agent_id)).size}`;
+      const unique = new Map();
+      for (const r of mapped) {
+        const key = `${r.agent_id}__${r.language_model}`;
+        unique.set(key, {agent_id: r.agent_id, model: r.language_model});
+      }
+      const byModel = {};
+      unique.forEach(({agent_id, model}) => {
+        byModel[model] = (byModel[model] || new Set());
+        byModel[model].add(agent_id);
+      });
+      const labels = Object.keys(byModel);
+      const data = labels.map(l => byModel[l].size);
+      const ctx = document.getElementById("chart-agent-models");
+      state.charts.agentModels && state.charts.agentModels.destroy();
+      state.charts.agentModels = new Chart(ctx, {
+        type: "bar",
+        data: { labels, datasets: [{ label: "Mapped agents", data, backgroundColor: "#6366f1" }] },
+        options: { responsive: true, plugins: { legend: { display: false } } }
+      });
+      state.aggregates.agent_model_dist = labels.map((m,i)=>({Model:m, Agents:data[i]}));
+    }
+
+    function downloadExcel() {
+      const wb = XLSX.utils.book_new();
+      const addSheet = (name, rows) => {
+        if (!rows || !rows.length) return;
+        const ws = XLSX.utils.json_to_sheet(rows);
+        XLSX.utils.book_append_sheet(wb, ws, name);
+      };
+      addSheet("model_distribution", state.aggregates.model_distribution);
+      addSheet("user_leaderboard", state.aggregates.user_leaderboard);
+      addSheet("daily_credits", state.aggregates.daily_credits);
+      addSheet("agent_model_distribution", state.aggregates.agent_model_dist);
+      if (state.rows && state.rows.length) {
+        addSheet("filtered_rows", state.rows.slice(0, 50000)); // cap to avoid huge file
+      }
+      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      const blob = new Blob([wbout], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "credit_dashboard_export.xlsx";
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    async function parseFile(file) {
+      return new Promise((resolve, reject) => {
+        const name = (file.name || "").toLowerCase();
+        if (name.endsWith(".csv")) {
+          Papa.parse(file, {
+            header: true,
+            skipEmptyLines: true,
+            complete: res => resolve(res.data),
+            error: err => reject(err)
+          });
+        } else if (name.endsWith(".xls") || name.endsWith(".xlsx")) {
+          const reader = new FileReader();
+          reader.onload = e => {
+            const data = new Uint8Array(e.target.result);
+            const wb = XLSX.read(data, { type: "array" });
+            const sheet = wb.Sheets[wb.SheetNames[0]];
+            const json = XLSX.utils.sheet_to_json(sheet);
+            resolve(json);
+          };
+          reader.onerror = err => reject(err);
+          reader.readAsArrayBuffer(file);
+        } else {
+          reject(new Error("Unsupported file type"));
+        }
+      });
+    }
+
+    document.getElementById("btn-process").onclick = async () => {
+      const fileMain = document.getElementById("file-main").files[0];
+      const fileAgents = document.getElementById("file-agents").files[0];
+      const maxRows = Number(document.getElementById("max-rows").value) || 400000;
+      if (!fileMain) {
+        setStatus("Please choose a main file.");
+        return;
+      }
+      setStatus("Parsing main file...");
+      try {
+        const raw = await parseFile(fileMain);
+        const cleaned = cleanRows(raw, maxRows);
+        if (!cleaned.length) {
+          setStatus("No valid rows after cleaning.");
+          return;
+        }
+        state.rows = cleaned;
+        setStatus(`Loaded ${cleaned.length.toLocaleString()} rows.`);
+      } catch (err) {
+        console.error(err);
+        setStatus("Failed to parse main file: " + err.message);
+        return;
+      }
+
+      // Agent JSON (optional)
+      if (fileAgents) {
+        try {
+          setStatus("Parsing agent JSON...");
+          const text = await fileAgents.text();
+          const data = JSON.parse(text);
+          const map = {};
+          if (Array.isArray(data)) {
+            for (const item of data) {
+              if (!item || typeof item !== "object") continue;
+              const agentId = String(item._id || item.agent_id || item.id || "").trim();
+              if (!agentId) continue;
+              map[agentId] = { name: item.name || "", features: item.features || [] };
+            }
+          }
+          state.agents = map;
+        } catch (err) {
+          console.warn("Agent JSON parse failed", err);
+          state.agents = {};
+        }
+      } else {
+        state.agents = {};
+      }
+
+      renderMetrics(state.rows);
+      renderModelChart(state.rows);
+      renderUsers(state.rows);
+      renderDailyChart(state.rows);
+      renderAgentModelChart(state.rows, state.agents);
+      document.getElementById("btn-download").disabled = false;
+      setStatus("Ready.");
+    };
+
+    document.getElementById("btn-download").onclick = downloadExcel;
+  </script>
+</body>
+</html>
