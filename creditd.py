@@ -878,8 +878,8 @@ if not user_usage_df.empty:
 st.markdown("---")
 st.subheader("Visualizations")
 
-tab_org, tab_activity, tab_allotment, tab_user_usage, tab_latency, tab_daily_users = st.tabs(
-    ["Org Usage", "User Activity", "Credit Allotment", "User Usage", "Latency", "Daily Credits"]
+tab_org, tab_activity, tab_allotment, tab_user_usage, tab_latency, tab_daily_users, tab_latency_deep = st.tabs(
+    ["Org Usage", "User Activity", "Credit Allotment", "User Usage", "Latency", "Daily Credits", "Latency Deep Dive"]
 )
 
 with tab_org:
@@ -1125,7 +1125,7 @@ with tab_user_usage:
 
 with tab_latency:
     st.caption("Latency trends for the selected period (when latency is present in the export).")
-    latency_df = visible_df.dropna(subset=["latency_ms"]) if "latency_ms" in visible_df.columns else pd.DataFrame()
+    latency_df = visible_enriched_df.dropna(subset=["latency_ms"]) if "latency_ms" in visible_enriched_df.columns else pd.DataFrame()
 
     if latency_df.empty:
         st.info("No latency data available for this period.")
@@ -1266,6 +1266,156 @@ with tab_daily_users:
 
         layered_chart = base.mark_area(opacity=0.15) + base.mark_line(point=True, strokeWidth=2)
         st.altair_chart(layered_chart, use_container_width=True)
+
+with tab_latency_deep:
+    st.caption("Latency deep dive: time-of-day heatmap, model trends by day/month/year, and office breakdown (requires roles).")
+    latency_df = (
+        visible_enriched_df.dropna(subset=["latency_ms"])
+        if "latency_ms" in visible_enriched_df.columns
+        else pd.DataFrame()
+    )
+
+    if latency_df.empty:
+        st.info("No latency data available for this period.")
+    else:
+        latency_df = latency_df.copy()
+        latency_df["date"] = latency_df["created_at"].dt.date
+        latency_df["date_ts"] = pd.to_datetime(latency_df["date"])
+        latency_df["hour"] = latency_df["created_at"].dt.hour
+        latency_df["month_start"] = latency_df["created_at"].dt.to_period("M").apply(lambda p: p.start_time)
+        latency_df["year"] = latency_df["created_at"].dt.year
+        latency_df["Model"] = latency_df["language_model"]
+
+        # Daily heatmap by hour
+        st.markdown("##### Latency by day and hour")
+        hourly = (
+            latency_df
+            .groupby(["date_ts", "hour"])["latency_ms"]
+            .agg(
+                avg_latency_ms="mean",
+                p95_latency_ms=lambda s: s.quantile(0.95),
+                samples="count",
+            )
+            .reset_index()
+        )
+        heatmap = (
+            alt.Chart(hourly)
+            .mark_rect()
+            .encode(
+                x=alt.X("hour:O", title="Hour of day"),
+                y=alt.Y("date_ts:T", title="Date"),
+                color=alt.Color("avg_latency_ms:Q", title="Avg latency (ms)", scale=alt.Scale(scheme="blues")),
+                tooltip=[
+                    alt.Tooltip("date_ts:T", title="Date"),
+                    alt.Tooltip("hour:O", title="Hour"),
+                    alt.Tooltip("avg_latency_ms:Q", format=",.0f", title="Avg latency (ms)"),
+                    alt.Tooltip("p95_latency_ms:Q", format=",.0f", title="P95 latency (ms)"),
+                    alt.Tooltip("samples:Q", format=",", title="Samples"),
+                ],
+            )
+            .properties(height=320, title="Avg latency heatmap")
+        )
+        st.altair_chart(heatmap, use_container_width=True)
+
+        # Helper for model/time aggregation
+        def model_timeframe(df: pd.DataFrame, period_col: str) -> pd.DataFrame:
+            return (
+                df
+                .groupby([period_col, "Model"])
+                .agg(
+                    avg_latency_ms=("latency_ms", "mean"),
+                    p95_latency_ms=("latency_ms", lambda s: s.quantile(0.95)),
+                    samples=("latency_ms", "count"),
+                )
+                .reset_index()
+            )
+
+        def model_metric_chart(frame: pd.DataFrame, x_field: str, x_title: str, metric: str, metric_title: str, x_type: str):
+            if frame.empty:
+                st.info(f"No latency by model for {x_title.lower()}.")
+                return None
+            return (
+                alt.Chart(frame)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X(f"{x_field}:{x_type}", title=x_title),
+                    y=alt.Y(f"{metric}:Q", title=metric_title),
+                    color=alt.Color("Model:N", title="Model"),
+                    tooltip=[
+                        alt.Tooltip(x_field + (":T" if x_type == "T" else ":O"), title=x_title),
+                        alt.Tooltip("Model:N", title="Model"),
+                        alt.Tooltip(f"{metric}:Q", format=",.0f", title=metric_title),
+                        alt.Tooltip("avg_latency_ms:Q", format=",.0f", title="Avg latency (ms)"),
+                        alt.Tooltip("p95_latency_ms:Q", format=",.0f", title="P95 latency (ms)"),
+                        alt.Tooltip("samples:Q", format=",", title="Samples"),
+                    ],
+                )
+                .properties(height=260)
+            )
+
+        st.markdown("##### Latency by model over time")
+        daily_model = model_timeframe(latency_df, "date_ts")
+        monthly_model = model_timeframe(latency_df, "month_start")
+        yearly_model = model_timeframe(latency_df, "year")
+
+        day_p95_chart = model_metric_chart(daily_model, "date_ts", "Date", "p95_latency_ms", "P95 latency (ms)", "T")
+        month_p95_chart = model_metric_chart(monthly_model, "month_start", "Month", "p95_latency_ms", "P95 latency (ms)", "T")
+        year_p95_chart = model_metric_chart(yearly_model, "year", "Year", "p95_latency_ms", "P95 latency (ms)", "O")
+
+        day_avg_chart = model_metric_chart(daily_model, "date_ts", "Date", "avg_latency_ms", "Avg latency (ms)", "T")
+        month_avg_chart = model_metric_chart(monthly_model, "month_start", "Month", "avg_latency_ms", "Avg latency (ms)", "T")
+        year_avg_chart = model_metric_chart(yearly_model, "year", "Year", "avg_latency_ms", "Avg latency (ms)", "O")
+
+        model_col1, model_col2 = st.columns(2)
+        with model_col1:
+            if day_p95_chart is not None:
+                st.altair_chart(day_p95_chart.properties(title="P95 latency by model (daily)"), use_container_width=True)
+            if day_avg_chart is not None:
+                st.altair_chart(day_avg_chart.properties(title="Average latency by model (daily)"), use_container_width=True)
+        with model_col2:
+            if month_p95_chart is not None:
+                st.altair_chart(month_p95_chart.properties(title="P95 latency by model (monthly)"), use_container_width=True)
+            if month_avg_chart is not None:
+                st.altair_chart(month_avg_chart.properties(title="Average latency by model (monthly)"), use_container_width=True)
+            if year_p95_chart is not None:
+                st.altair_chart(year_p95_chart.properties(title="P95 latency by model (yearly)"), use_container_width=True)
+            if year_avg_chart is not None:
+                st.altair_chart(year_avg_chart.properties(title="Average latency by model (yearly)"), use_container_width=True)
+
+        # Latency by office (requires roles)
+        st.markdown("##### Latency by office (requires roles)")
+        office_latency = latency_df[latency_df["office"] != ""]
+        if office_latency.empty:
+            st.info("Upload Prophet roles.xlsx to see office-level latency.")
+        else:
+            office_summary = (
+                office_latency
+                .groupby("office")["latency_ms"]
+                .agg(
+                    avg_latency_ms="mean",
+                    p95_latency_ms=lambda s: s.quantile(0.95),
+                    samples="count",
+                )
+                .reset_index()
+                .rename(columns={"office": "Office"})
+                .sort_values("p95_latency_ms", ascending=False)
+            )
+            office_chart = (
+                alt.Chart(office_summary)
+                .mark_bar()
+                .encode(
+                    y=alt.Y("Office:N", sort="-x", title="Office"),
+                    x=alt.X("p95_latency_ms:Q", title="P95 latency (ms)"),
+                    tooltip=[
+                        alt.Tooltip("Office:N", title="Office"),
+                        alt.Tooltip("p95_latency_ms:Q", format=",.0f", title="P95 latency (ms)"),
+                        alt.Tooltip("avg_latency_ms:Q", format=",.0f", title="Avg latency (ms)"),
+                        alt.Tooltip("samples:Q", format=",", title="Samples"),
+                    ],
+                )
+                .properties(height=320, title="Latency by office (P95)")
+            )
+            st.altair_chart(office_chart, use_container_width=True)
 
 st.markdown("---")
 st.markdown(
