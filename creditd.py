@@ -13,6 +13,29 @@ BURST_THRESHOLD = 10
 CSV_CHUNK_SIZE = 150_000
 MAX_ROWS = 1_000_000
 RAW_EXPORT_LIMIT = 50_000
+INPUT_MESSAGE_CANDIDATES = (
+    "input_messages",
+    "input_message",
+    "input",
+    "messages",
+    "prompt",
+    "user_input",
+)
+OUTPUT_MESSAGE_CANDIDATES = (
+    "output_message",
+    "response_message",
+    "assistant_message",
+    "assistant_response",
+    "output",
+    "response",
+)
+SESSION_ID_CANDIDATES = (
+    "session_id",
+    "session",
+    "conversation_id",
+    "chat_id",
+    "run_id",
+)
 
 st.set_page_config(
     page_title="Credit Consumption Dashboard",
@@ -537,9 +560,10 @@ def user_breakdown(
                 .agg(
                     Calls=("email", "size"),
                     Credits=("credits", "sum"),
+                    Agents=("agent_id", lambda s: s[s != "(unassigned)"].nunique()),
                 )
                 .reset_index()
-                .rename(columns={"email": "User"})
+                .rename(columns={"email": "User", "Agents": "Agents Engaged"})
     )
     grouped["Credits"] = grouped["Credits"].round(2)
     grouped["Credits per Call"] = grouped.apply(
@@ -549,6 +573,10 @@ def user_breakdown(
     grouped["Credits per Call"] = grouped["Credits per Call"].round(2)
     grouped = grouped.sort_values("Credits", ascending=False)
     grouped.insert(0, "#", range(1, len(grouped) + 1))
+    total_user_credits = grouped["Credits"].sum()
+    grouped["Credit Share (%)"] = (
+        (grouped["Credits"] / total_user_credits * 100).round(1) if total_user_credits > 0 else np.nan
+    )
     grouped.insert(
         1,
         "Rank Change",
@@ -579,9 +607,9 @@ def user_breakdown(
         grouped["Discipline"] = grouped["User"].str.lower().map(roles_lookup["discipline"]).fillna("")
         grouped["Office"] = grouped["User"].str.lower().map(roles_lookup["office"]).fillna("")
 
-        ordered_columns = ["#", "Rank Change", "User", "Role", "Discipline", "Office", "Calls", "Credits", "Credits per Call", "Over 12k Credits", "Burst Detected", "Flags"]
+        ordered_columns = ["#", "Rank Change", "User", "Role", "Discipline", "Office", "Calls", "Credits", "Credit Share (%)", "Credits per Call", "Agents Engaged", "Over 12k Credits", "Burst Detected", "Flags"]
     else:
-        ordered_columns = ["#", "Rank Change", "User", "Calls", "Credits", "Credits per Call", "Over 12k Credits", "Burst Detected", "Flags"]
+        ordered_columns = ["#", "Rank Change", "User", "Calls", "Credits", "Credit Share (%)", "Credits per Call", "Agents Engaged", "Over 12k Credits", "Burst Detected", "Flags"]
 
     return grouped[ordered_columns]
 
@@ -671,6 +699,284 @@ def style_user_dataframe(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
         return styles
 
     return df.style.apply(highlight_user, axis=1)
+
+
+def select_first_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
+    """
+    Return the first matching column from the candidate list (case/space insensitive).
+    """
+    if df is None or df.empty:
+        return None
+
+    normalized = {normalize_column_name(col): col for col in df.columns}
+    for candidate in candidates:
+        key = normalize_column_name(candidate)
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def parse_jsonish(value):
+    """
+    Try to JSON-decode a value; fall back to the original string/object on failure.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+    return value
+
+
+def count_words(text: str | float | int | None) -> int:
+    """
+    Simple whitespace word count, ignoring empty/NaN values.
+    """
+    if text is None or (isinstance(text, float) and np.isnan(text)):
+        return 0
+    return len(str(text).split())
+
+
+def extract_user_text(payload) -> str:
+    """
+    Pull user-authored content from a chat payload shaped like:
+    [{"role":"system","content":"..."},{"role":"user","content":"..."}]
+    Falls back to the raw string for plain-text prompts.
+    """
+    parsed = parse_jsonish(payload)
+    if isinstance(parsed, list):
+        parts = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).lower()
+            if role == "user":
+                content = item.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(str(c) for c in content if c)
+                parts.append(str(content))
+        return "\n".join(p for p in parts if p).strip()
+    if isinstance(parsed, dict):
+        content = parsed.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(str(c) for c in content if c)
+        return str(content).strip()
+    if isinstance(parsed, str):
+        return parsed.strip()
+    return ""
+
+
+def extract_output_details(payload) -> tuple[str, int]:
+    """
+    Return (assistant_text, tool_call_count) from a response payload that may include
+    `content`, `tool_calls`, or `function_call`.
+    """
+    parsed = parse_jsonish(payload)
+    output_text = ""
+    tool_calls = 0
+
+    if isinstance(parsed, dict):
+        content = parsed.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(str(c) for c in content if c)
+        output_text = str(content).strip()
+
+        tc = parsed.get("tool_calls")
+        if isinstance(tc, list):
+            tool_calls = len(tc)
+        elif tc:
+            tool_calls = 1
+
+        fc = parsed.get("function_call")
+        if isinstance(fc, dict):
+            tool_calls = max(tool_calls, 1)
+    elif isinstance(parsed, list):
+        text_parts = []
+        for item in parsed:
+            if isinstance(item, dict):
+                role = str(item.get("role", "")).lower()
+                if role in ("assistant", "") and "content" in item:
+                    text_parts.append(str(item.get("content", "")))
+                if "tool_calls" in item and isinstance(item["tool_calls"], list):
+                    tool_calls = max(tool_calls, len(item["tool_calls"]))
+            else:
+                text_parts.append(str(item))
+        output_text = "\n".join(text_parts).strip()
+    elif isinstance(parsed, str):
+        output_text = parsed.strip()
+
+    return output_text, tool_calls
+
+
+def build_query_insights(df: pd.DataFrame) -> dict:
+    """
+    Derive query/message metrics (lengths, tool calls, chats per session) when
+    input/output and session columns are present.
+    """
+    result = {
+        "available": False,
+        "reason": "",
+        "rows": pd.DataFrame(),
+        "per_user": pd.DataFrame(),
+        "over_time": pd.DataFrame(),
+        "tool_calls_distribution": pd.DataFrame(),
+        "session_counts": pd.DataFrame(),
+        "session_over_time": pd.DataFrame(),
+        "summary": {},
+    }
+
+    if df is None or df.empty:
+        result["reason"] = "No rows available after filters."
+        return result
+
+    input_col = select_first_column(df, INPUT_MESSAGE_CANDIDATES)
+    output_col = select_first_column(df, OUTPUT_MESSAGE_CANDIDATES)
+    session_col = select_first_column(df, SESSION_ID_CANDIDATES)
+
+    if not any([input_col, output_col, session_col]):
+        result["reason"] = "Input/output/session columns not found in the data."
+        return result
+
+    working = pd.DataFrame(index=df.index)
+    working["created_at"] = df["created_at"]
+    working["email"] = df.get("email", "(no email)")
+
+    if input_col:
+        working["input_text"] = df[input_col].apply(extract_user_text)
+        working["input_words"] = working["input_text"].apply(count_words)
+    else:
+        working["input_text"] = ""
+        working["input_words"] = np.nan
+
+    if output_col:
+        output_details = df[output_col].apply(extract_output_details)
+        working["output_text"] = output_details.apply(lambda t: t[0])
+        working["tool_calls"] = output_details.apply(lambda t: t[1])
+        working["output_words"] = working["output_text"].apply(count_words)
+    else:
+        working["output_text"] = ""
+        working["tool_calls"] = np.nan
+        working["output_words"] = np.nan
+
+    if session_col:
+        working["session_id"] = (
+            df[session_col]
+            .astype(str)
+            .str.strip()
+            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "none": pd.NA})
+        )
+    else:
+        working["session_id"] = pd.NA
+
+    working["created_date"] = working["created_at"].dt.date
+
+    # Keep rows that have at least some message content
+    valid_mask = (
+        working["input_words"].fillna(0) > 0
+    ) | (working["output_words"].fillna(0) > 0)
+    query_rows = working[valid_mask].copy()
+
+    if query_rows.empty:
+        result["reason"] = "Message columns were found, but no usable text was detected."
+        return result
+
+    per_user = (
+        query_rows[query_rows["email"] != "(no email)"]
+        .groupby("email")
+        .agg(
+            avg_input_words=("input_words", "mean"),
+            avg_output_words=("output_words", "mean"),
+            avg_tool_calls=("tool_calls", "mean"),
+            messages=("input_words", "size"),
+        )
+        .reset_index()
+        .rename(columns={"email": "User"})
+        .sort_values("messages", ascending=False)
+    )
+
+    over_time = (
+        query_rows
+        .groupby("created_date")
+        .agg(
+            avg_input_words=("input_words", "mean"),
+            avg_output_words=("output_words", "mean"),
+            avg_tool_calls=("tool_calls", "mean"),
+            messages=("input_words", "size"),
+        )
+        .reset_index()
+        .rename(columns={"created_date": "Date"})
+        .sort_values("Date")
+    )
+
+    tool_calls_distribution = pd.DataFrame()
+    if "tool_calls" in query_rows.columns:
+        tool_calls_distribution = (
+            query_rows.assign(tool_calls=lambda d: pd.to_numeric(d["tool_calls"], errors="coerce").fillna(0).astype(int))
+            .groupby("tool_calls")
+            .size()
+            .reset_index(name="Count")
+            .rename(columns={"tool_calls": "Tool Calls"})
+            .sort_values("Tool Calls")
+        )
+
+    session_counts = pd.DataFrame()
+    session_over_time = pd.DataFrame()
+    sessions_df = query_rows.dropna(subset=["session_id"])
+    if not sessions_df.empty:
+        def primary_user(series: pd.Series) -> str:
+            non_empty = series[series != "(no email)"]
+            if non_empty.empty:
+                return "(no email)"
+            try:
+                return non_empty.mode().iat[0]
+            except Exception:
+                return non_empty.iloc[0]
+
+        session_counts = (
+            sessions_df
+            .groupby("session_id")
+            .agg(
+                Chats=("session_id", "size"),
+                First_Seen=("created_at", "min"),
+                User=("email", primary_user),
+            )
+            .reset_index()
+            .rename(columns={"session_id": "Session ID"})
+            .sort_values("Chats", ascending=False)
+        )
+        session_counts["First_Seen"] = pd.to_datetime(session_counts["First_Seen"])
+        session_counts["Start Date"] = session_counts["First_Seen"].dt.date
+
+        session_over_time = (
+            session_counts
+            .groupby("Start Date")
+            .agg(
+                avg_chats_per_session=("Chats", "mean"),
+                sessions=("Session ID", "count"),
+            )
+            .reset_index()
+            .rename(columns={"Start Date": "Date"})
+            .sort_values("Date")
+        )
+
+    result["available"] = True
+    result["rows"] = query_rows
+    result["per_user"] = per_user
+    result["over_time"] = over_time
+    result["tool_calls_distribution"] = tool_calls_distribution
+    result["session_counts"] = session_counts
+    result["session_over_time"] = session_over_time
+    result["summary"] = {
+        "avg_input_words": query_rows["input_words"].mean(),
+        "avg_output_words": query_rows["output_words"].mean(),
+        "avg_tool_calls": pd.to_numeric(query_rows["tool_calls"], errors="coerce").mean(),
+        "avg_chats_per_session": session_counts["Chats"].mean() if not session_counts.empty else np.nan,
+    }
+
+    return result
 
 
 # ---------- UI ----------
@@ -830,6 +1136,23 @@ monthly_usage_df["month_label"] = monthly_usage_df["month_key"].apply(
 )
 monthly_usage_df["cumulative_credits"] = monthly_usage_df["total_credits"].cumsum()
 
+weekly_usage_df = (
+    monthly_base.groupby("week_key")
+    .agg(
+        total_credits=("credits", "sum"),
+        total_calls=("credits", "size"),
+        active_users=("email", lambda s: s[s != "(no email)"].nunique()),
+    )
+    .reset_index()
+    .sort_values("week_key")
+)
+weekly_usage_df["week_start"] = weekly_usage_df["week_key"].apply(lambda w: pd.Period(w, freq="W-SUN").start_time)
+weekly_usage_df["week_end"] = weekly_usage_df["week_start"] + pd.Timedelta(days=6)
+weekly_usage_df["week_label"] = weekly_usage_df.apply(
+    lambda row: f"{row['week_start']:%b %d} – {row['week_end']:%b %d}",
+    axis=1,
+)
+
 # Timeframe selection (month/week/day)
 time_granularity = st.radio(
     "Timeframe",
@@ -873,6 +1196,7 @@ previous_ranks = compute_rank_map(previous_visible_df)
 burst_users = detect_burst_users(visible_df, threshold=BURST_THRESHOLD)
 visible_enriched_df = enrich_with_roles(visible_df, roles_df)
 visible_enriched_df = enrich_with_agents(visible_enriched_df, agents_df)
+query_insights = build_query_insights(visible_enriched_df)
 
 # Embedding share is *always* computed on the full period
 embeddings_df = period_slice[period_slice["call_type"] == "aembedding"]
@@ -1106,14 +1430,40 @@ kb_df = pd.DataFrame()
 ctx_df = pd.DataFrame()
 mem_df = pd.DataFrame()
 agent_model_distribution_df = pd.DataFrame()
+agent_engagement_df = pd.DataFrame()
+
+if agents_available and not visible_enriched_df.empty:
+    mapped_agents = visible_enriched_df[
+        (visible_enriched_df["agent_name"] != "") &
+        (visible_enriched_df["agent_id"] != "(unassigned)")
+    ].copy()
+    if not mapped_agents.empty:
+        agent_engagement_df = (
+            mapped_agents
+            .groupby(["agent_id", "agent_name"], dropna=False)
+            .agg(
+                Calls=("agent_id", "size"),
+                Credits=("credits", "sum"),
+                Unique_Users=("email", lambda s: s[s != "(no email)"].nunique()),
+            )
+            .reset_index()
+            .rename(columns={"agent_id": "Agent ID", "agent_name": "Agent", "Unique_Users": "Unique Users"})
+            .sort_values("Credits", ascending=False)
+        )
+        agent_engagement_df["Credits"] = agent_engagement_df["Credits"].round(2)
+        total_visible_credits = total_credits_visible if "total_credits_visible" in locals() else visible_enriched_df["credits"].sum()
+        agent_engagement_df["Credit Share (%)"] = agent_engagement_df.apply(
+            lambda row: (row["Credits"] / total_visible_credits * 100) if total_visible_credits > 0 else np.nan,
+            axis=1,
+        ).round(1)
 
 # ---------- Charts & visualizations ----------
 
 st.markdown("---")
 st.subheader("Visualizations")
 
-tab_org, tab_activity, tab_allotment, tab_user_usage, tab_latency, tab_daily_users, tab_latency_deep, tab_agent_latency, tab_user_detail = st.tabs(
-    ["Org Usage", "User Activity", "Credit Allotment", "User Usage", "Latency", "Daily Credits", "Latency Deep Dive", "Agent Latency", "User Detail"]
+tab_org, tab_activity, tab_allotment, tab_user_usage, tab_latency, tab_daily_users, tab_latency_deep, tab_agent_latency, tab_agent_engagement, tab_query, tab_user_detail = st.tabs(
+    ["Org Usage", "User Activity", "Credit Allotment", "User Usage", "Latency", "Daily Credits", "Latency Deep Dive", "Agent Latency", "Agent Engagement", "Query Insights", "User Detail"]
 )
 
 with tab_org:
@@ -1257,6 +1607,27 @@ with tab_allotment:
             ),
             use_container_width=True,
         )
+
+        st.markdown("##### Weekly credits over time")
+        if weekly_usage_df.empty:
+            st.info("No weekly data to display.")
+        else:
+            weekly_chart = (
+                alt.Chart(weekly_usage_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("week_start:T", title="Week starting"),
+                    y=alt.Y("total_credits:Q", title="Weekly Credits"),
+                    tooltip=[
+                        alt.Tooltip("week_label:N", title="Week"),
+                        alt.Tooltip("total_credits:Q", format=",", title="Credits"),
+                        alt.Tooltip("total_calls:Q", format=",", title="Calls"),
+                        alt.Tooltip("active_users:Q", format=",", title="Active users"),
+                    ],
+                )
+                .properties(height=280)
+            )
+            st.altair_chart(weekly_chart, use_container_width=True)
 
 with tab_user_usage:
     st.caption("Per-user usage for the selected period (filters applied; blank emails excluded).")
@@ -1863,6 +2234,183 @@ with tab_agent_latency:
                     )
                     st.altair_chart(dist_chart, use_container_width=True)
 
+with tab_agent_engagement:
+    st.caption("Mapped agents (from AgentID Names.json): calls, credits, and unique users.")
+    if not agents_available:
+        st.info("Upload AgentID Names.json to view mapped agent engagement.")
+    elif agent_engagement_df.empty:
+        st.info("No mapped agents found in this period.")
+    else:
+        st.dataframe(
+            agent_engagement_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        engagement_chart = (
+            alt.Chart(agent_engagement_df.head(30))
+            .mark_bar()
+            .encode(
+                y=alt.Y("Agent:N", sort="-x", title="Agent"),
+                x=alt.X("Credits:Q", title="Credits"),
+                tooltip=[
+                    alt.Tooltip("Agent:N", title="Agent"),
+                    alt.Tooltip("Credits:Q", format=",", title="Credits"),
+                    alt.Tooltip("Calls:Q", format=",", title="Calls"),
+                    alt.Tooltip("Unique Users:Q", format=",", title="Unique users"),
+                    alt.Tooltip("Credit Share (%):Q", title="Credit share (%)"),
+                ],
+            )
+            .properties(height=320, title="Credits by mapped agent (top 30)")
+        )
+        st.altair_chart(engagement_chart, use_container_width=True)
+
+        users_chart = (
+            alt.Chart(agent_engagement_df.head(30))
+            .mark_bar(color="#f59e0b")
+            .encode(
+                y=alt.Y("Agent:N", sort="-x", title="Agent"),
+                x=alt.X("Unique Users:Q", title="Unique users"),
+                tooltip=[
+                    alt.Tooltip("Agent:N", title="Agent"),
+                    alt.Tooltip("Unique Users:Q", format=",", title="Unique users"),
+                    alt.Tooltip("Calls:Q", format=",", title="Calls"),
+                    alt.Tooltip("Credits:Q", format=",", title="Credits"),
+                    alt.Tooltip("Credit Share (%):Q", title="Credit share (%)"),
+                ],
+            )
+            .properties(height=320, title="Unique users by mapped agent (top 30)")
+        )
+        st.altair_chart(users_chart, use_container_width=True)
+
+with tab_query:
+    st.caption(
+        "Insights from input/output messages (e.g., `input_messages`, `output_message`) and chat sessions (`session_id`)."
+    )
+    if not query_insights.get("available"):
+        st.info(query_insights.get("reason") or "Message and session columns not found in this export.")
+    else:
+        summary = query_insights.get("summary", {})
+
+        def fmt_avg(val):
+            return f"{val:,.1f}" if pd.notna(val) else "—"
+
+        qc1, qc2, qc3, qc4 = st.columns(4)
+        with qc1:
+            st.metric("Avg input length (words)", fmt_avg(summary.get("avg_input_words")))
+        with qc2:
+            st.metric("Avg output length (words)", fmt_avg(summary.get("avg_output_words")))
+        with qc3:
+            st.metric("Avg tool calls per response", fmt_avg(summary.get("avg_tool_calls")))
+        with qc4:
+            st.metric("Avg chats per session", fmt_avg(summary.get("avg_chats_per_session")))
+
+        st.markdown("##### Query length over time")
+        over_time_df = query_insights.get("over_time", pd.DataFrame())
+        if over_time_df.empty:
+            st.info("No time-based query data available.")
+        else:
+            over_time_long = over_time_df.melt(
+                id_vars=["Date"],
+                value_vars=["avg_input_words", "avg_output_words"],
+                var_name="Metric",
+                value_name="Value",
+            )
+            metric_labels = {
+                "avg_input_words": "Avg input length",
+                "avg_output_words": "Avg output length",
+            }
+            over_time_long["Metric"] = over_time_long["Metric"].map(metric_labels)
+            time_chart = (
+                alt.Chart(over_time_long)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("Date:T", title="Date"),
+                    y=alt.Y("Value:Q", title="Words"),
+                    color=alt.Color("Metric:N", title="Metric"),
+                    tooltip=[
+                        alt.Tooltip("Date:T", title="Date"),
+                        alt.Tooltip("Metric:N"),
+                        alt.Tooltip("Value:Q", format=",.1f", title="Words"),
+                    ],
+                )
+                .properties(height=280, title="Average query length (words)")
+            )
+            st.altair_chart(time_chart, use_container_width=True)
+
+        st.markdown("##### Average query length by user")
+        per_user_df = query_insights.get("per_user", pd.DataFrame())
+        if per_user_df.empty:
+            st.info("No user-level query data available.")
+        else:
+            display_user = per_user_df.copy()
+            for col in ("avg_input_words", "avg_output_words", "avg_tool_calls"):
+                display_user[col] = display_user[col].round(1)
+            st.dataframe(
+                display_user.head(50).rename(columns={
+                    "avg_input_words": "Avg Input (words)",
+                    "avg_output_words": "Avg Output (words)",
+                    "avg_tool_calls": "Avg Tool Calls",
+                    "messages": "Messages",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("##### Tool calls per response")
+        tool_dist = query_insights.get("tool_calls_distribution", pd.DataFrame())
+        if tool_dist.empty:
+            st.info("No tool call data available in message payloads.")
+        else:
+            tool_chart = (
+                alt.Chart(tool_dist)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Tool Calls:O", title="Tool calls per assistant message"),
+                    y=alt.Y("Count:Q", title="Responses"),
+                    tooltip=[
+                        alt.Tooltip("Tool Calls:O", title="Tool calls"),
+                        alt.Tooltip("Count:Q", format=",", title="Responses"),
+                    ],
+                )
+                .properties(height=260, title="Distribution of tool calls")
+            )
+            st.altair_chart(tool_chart, use_container_width=True)
+
+        st.markdown("##### Chats per session")
+        session_counts = query_insights.get("session_counts", pd.DataFrame())
+        session_over_time = query_insights.get("session_over_time", pd.DataFrame())
+
+        if session_counts.empty:
+            st.info("No session_id column found or no sessions detected.")
+        else:
+            session_display = session_counts.copy()
+            session_display["Chats"] = session_display["Chats"].astype(int)
+            st.dataframe(
+                session_display[["Session ID", "User", "Chats", "Start Date"]].head(50),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if session_over_time.empty:
+                st.info("No session timeline available.")
+            else:
+                session_chart = (
+                    alt.Chart(session_over_time)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("Date:T", title="Session start date"),
+                        y=alt.Y("avg_chats_per_session:Q", title="Avg chats per session"),
+                        tooltip=[
+                            alt.Tooltip("Date:T", title="Date"),
+                            alt.Tooltip("avg_chats_per_session:Q", format=",.1f", title="Avg chats"),
+                            alt.Tooltip("sessions:Q", format=",", title="Sessions"),
+                        ],
+                    )
+                    .properties(height=280, title="Chats per session over time")
+                )
+                st.altair_chart(session_chart, use_container_width=True)
+
 with tab_user_detail:
     st.caption("Drill into a single user: models used, daily credits, hour-of-day patterns, and agent mix.")
     if user_usage_df.empty:
@@ -1885,9 +2433,10 @@ with tab_user_detail:
             total_credits_user = user_df["credits"].sum()
             total_calls_user = len(user_df)
             credits_per_call_user = (total_credits_user / total_calls_user) if total_calls_user > 0 else np.nan
+            agent_count_user = user_df[user_df["agent_id"] != "(unassigned)"]["agent_id"].nunique()
 
             user_latency = user_df["latency_ms"].dropna() if "latency_ms" in user_df.columns else pd.Series(dtype="float")
-            col_u1, col_u2, col_u3, col_u4 = st.columns(4)
+            col_u1, col_u2, col_u3, col_u4, col_u5 = st.columns(5)
             with col_u1:
                 st.metric("Credits", f"{total_credits_user:,.2f}")
             with col_u2:
@@ -1895,6 +2444,8 @@ with tab_user_detail:
             with col_u3:
                 st.metric("Credits per Call", f"{credits_per_call_user:,.2f}" if pd.notna(credits_per_call_user) else "—")
             with col_u4:
+                st.metric("Agents Engaged", f"{agent_count_user:,}")
+            with col_u5:
                 if user_latency.empty:
                     st.metric("P95 Latency", "—")
                 else:
@@ -2002,6 +2553,7 @@ export_sheets = {
     "agent_breakdown": agent_df,
     "daily_credits": daily_all_df,
     "monthly_usage": monthly_usage_df,
+    "weekly_usage": weekly_usage_df,
     "latency_daily": daily_latency_df,
     "latency_by_model": latency_by_model_df,
     "agent_latency": agent_latency_summary_df,
@@ -2009,7 +2561,14 @@ export_sheets = {
     "agent_latency_context": ctx_df,
     "agent_latency_memory": mem_df,
     "agent_model_distribution": agent_model_distribution_df,
+    "agent_engagement": agent_engagement_df,
     "user_usage": user_usage_df,
+    "query_rows": query_insights.get("rows", pd.DataFrame()).head(RAW_EXPORT_LIMIT),
+    "query_per_user": query_insights.get("per_user", pd.DataFrame()),
+    "query_over_time": query_insights.get("over_time", pd.DataFrame()),
+    "query_tool_calls": query_insights.get("tool_calls_distribution", pd.DataFrame()),
+    "session_chat_counts": query_insights.get("session_counts", pd.DataFrame()),
+    "session_over_time": query_insights.get("session_over_time", pd.DataFrame()),
 }
 if not visible_df.empty:
     export_sheets["filtered_rows"] = visible_df.head(RAW_EXPORT_LIMIT)
