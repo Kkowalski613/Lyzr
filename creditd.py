@@ -23,6 +23,7 @@ INPUT_MESSAGE_CANDIDATES = (
 )
 OUTPUT_MESSAGE_CANDIDATES = (
     "output_message",
+    "output_messages",
     "response_message",
     "assistant_message",
     "assistant_response",
@@ -779,7 +780,11 @@ def extract_output_details(payload) -> tuple[str, int]:
     tool_calls = 0
 
     if isinstance(parsed, dict):
-        content = parsed.get("content", "")
+        content = (
+            parsed.get("content", "")
+            or parsed.get("message", "")
+            or parsed.get("text", "")
+        )
         if isinstance(content, list):
             content = " ".join(str(c) for c in content if c)
         output_text = str(content).strip()
@@ -825,6 +830,7 @@ def build_query_insights(df: pd.DataFrame) -> dict:
         "tool_calls_distribution": pd.DataFrame(),
         "session_counts": pd.DataFrame(),
         "session_over_time": pd.DataFrame(),
+        "latency_vs_input": pd.DataFrame(),
         "summary": {},
     }
 
@@ -843,6 +849,7 @@ def build_query_insights(df: pd.DataFrame) -> dict:
     working = pd.DataFrame(index=df.index)
     working["created_at"] = df["created_at"]
     working["email"] = df.get("email", "(no email)")
+    working["latency_ms"] = pd.to_numeric(df.get("latency_ms", np.nan), errors="coerce")
 
     if input_col:
         working["input_text"] = df[input_col].apply(extract_user_text)
@@ -969,6 +976,17 @@ def build_query_insights(df: pd.DataFrame) -> dict:
     result["tool_calls_distribution"] = tool_calls_distribution
     result["session_counts"] = session_counts
     result["session_over_time"] = session_over_time
+    result["latency_vs_input"] = (
+        query_rows.dropna(subset=["latency_ms"])
+        .groupby("created_date")
+        .agg(
+            avg_input_words=("input_words", "mean"),
+            avg_latency_ms=("latency_ms", "mean"),
+        )
+        .reset_index()
+        .rename(columns={"created_date": "Date"})
+        .sort_values("Date")
+    )
     result["summary"] = {
         "avg_input_words": query_rows["input_words"].mean(),
         "avg_output_words": query_rows["output_words"].mean(),
@@ -1354,6 +1372,42 @@ with model_col:
             hide_index=True,
         )
 
+        model_share_chart = (
+            alt.Chart(model_df)
+            .mark_arc()
+            .encode(
+                theta=alt.Theta("Share (%):Q", title="Credit share (%)"),
+                color=alt.Color("Model:N", title="Model"),
+                tooltip=[
+                    alt.Tooltip("Model:N", title="Model"),
+                    alt.Tooltip("Credits:Q", format=",", title="Credits"),
+                    alt.Tooltip("Calls:Q", format=",", title="Calls"),
+                    alt.Tooltip("Credits per Call:Q", format=",.2f", title="Credits per call"),
+                    alt.Tooltip("Share (%):Q", title="Credit share (%)"),
+                ],
+            )
+            .properties(title="Model credit share")
+        )
+        st.altair_chart(model_share_chart, use_container_width=True)
+
+        credits_per_call_chart = (
+            alt.Chart(model_df)
+            .mark_bar()
+            .encode(
+                y=alt.Y("Model:N", sort="-x", title="Model"),
+                x=alt.X("Credits per Call:Q", title="Credits per call"),
+                tooltip=[
+                    alt.Tooltip("Model:N", title="Model"),
+                    alt.Tooltip("Credits per Call:Q", format=",.2f", title="Credits per call"),
+                    alt.Tooltip("Calls:Q", format=",", title="Calls"),
+                    alt.Tooltip("Credits:Q", format=",", title="Credits"),
+                    alt.Tooltip("Share (%):Q", title="Credit share (%)"),
+                ],
+            )
+            .properties(title="Credits per call by model", height=260)
+        )
+        st.altair_chart(credits_per_call_chart, use_container_width=True)
+
 # By user (email)
 with user_col:
     st.markdown("##### By User (Email)")
@@ -1423,6 +1477,31 @@ if not visible_df.empty:
     )
     daily_all_df["date"] = pd.to_datetime(daily_all_df["date"])
 
+daily_avg_agents_df = pd.DataFrame()
+agents_base = monthly_base[
+    (monthly_base["agent_id"] != "(unassigned)") & (monthly_base["email"] != "(no email)")
+].copy()
+if not agents_base.empty:
+    agents_base["date"] = agents_base["created_at"].dt.date
+    daily_user_agents = (
+        agents_base.groupby(["date", "email"])["agent_id"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"agent_id": "agents"})
+    )
+    daily_avg_agents_df = (
+        daily_user_agents
+        .groupby("date")
+        .agg(
+            avg_agents_per_user=("agents", "mean"),
+            users=("email", "nunique"),
+        )
+        .reset_index()
+        .rename(columns={"date": "Date"})
+        .sort_values("Date")
+    )
+    daily_avg_agents_df["Date"] = pd.to_datetime(daily_avg_agents_df["Date"])
+
 latency_by_model_df = pd.DataFrame()
 daily_latency_df = pd.DataFrame()
 agent_latency_summary_df = pd.DataFrame()
@@ -1431,6 +1510,7 @@ ctx_df = pd.DataFrame()
 mem_df = pd.DataFrame()
 agent_model_distribution_df = pd.DataFrame()
 agent_engagement_df = pd.DataFrame()
+daily_avg_agents_df = pd.DataFrame()
 
 if agents_available and not visible_enriched_df.empty:
     mapped_agents = visible_enriched_df[
@@ -1559,6 +1639,26 @@ with tab_activity:
             .properties(height=300, title="Average user activity")
         )
         st.altair_chart(activity_chart, use_container_width=True)
+
+    st.markdown("##### Avg agents engaged per user (daily)")
+    if daily_avg_agents_df.empty:
+        st.info("No agent engagement data available.")
+    else:
+        agents_chart = (
+            alt.Chart(daily_avg_agents_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("Date:T", title="Date"),
+                y=alt.Y("avg_agents_per_user:Q", title="Avg agents per user"),
+                tooltip=[
+                    alt.Tooltip("Date:T", title="Date"),
+                    alt.Tooltip("avg_agents_per_user:Q", format=",.2f", title="Avg agents"),
+                    alt.Tooltip("users:Q", format=",", title="Users"),
+                ],
+            )
+            .properties(height=260)
+        )
+        st.altair_chart(agents_chart, use_container_width=True)
 
 with tab_allotment:
     st.caption("Credits consumed vs monthly and annual allotments.")
@@ -1832,6 +1932,23 @@ with tab_latency:
 
 with tab_daily_users:
     st.caption("Layered daily credit consumption by top users (filters applied).")
+    if daily_all_df.empty:
+        st.info("No daily credit data available.")
+    else:
+        daily_total_chart = (
+            alt.Chart(daily_all_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("Credits:Q", title="Credits"),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("Credits:Q", format=",", title="Credits"),
+                ],
+            )
+            .properties(height=260, title="Daily credits (all users)")
+        )
+        st.altair_chart(daily_total_chart, use_container_width=True)
     daily_usage = visible_df[visible_df["email"] != "(no email)"].copy()
 
     if daily_usage.empty:
@@ -2377,6 +2494,28 @@ with tab_query:
             )
             st.altair_chart(tool_chart, use_container_width=True)
 
+        st.markdown("##### Avg latency vs avg input length")
+        latency_input_df = query_insights.get("latency_vs_input", pd.DataFrame())
+        if latency_input_df.empty:
+            st.info("No latency/input overlap found to chart.")
+        else:
+            scatter = (
+                alt.Chart(latency_input_df)
+                .mark_circle(size=80)
+                .encode(
+                    x=alt.X("avg_input_words:Q", title="Avg input length (words)"),
+                    y=alt.Y("avg_latency_ms:Q", title="Avg latency (ms)"),
+                    color=alt.Color("Date:T", title="Date"),
+                    tooltip=[
+                        alt.Tooltip("Date:T", title="Date"),
+                        alt.Tooltip("avg_input_words:Q", format=",.1f", title="Avg input (words)"),
+                        alt.Tooltip("avg_latency_ms:Q", format=",.0f", title="Avg latency (ms)"),
+                    ],
+                )
+                .properties(height=280, title="Avg latency vs avg input length (by day)")
+            )
+            st.altair_chart(scatter, use_container_width=True)
+
         st.markdown("##### Chats per session")
         session_counts = query_insights.get("session_counts", pd.DataFrame())
         session_over_time = query_insights.get("session_over_time", pd.DataFrame())
@@ -2554,6 +2693,7 @@ export_sheets = {
     "daily_credits": daily_all_df,
     "monthly_usage": monthly_usage_df,
     "weekly_usage": weekly_usage_df,
+    "avg_agents_per_user_daily": daily_avg_agents_df,
     "latency_daily": daily_latency_df,
     "latency_by_model": latency_by_model_df,
     "agent_latency": agent_latency_summary_df,
@@ -2567,6 +2707,7 @@ export_sheets = {
     "query_per_user": query_insights.get("per_user", pd.DataFrame()),
     "query_over_time": query_insights.get("over_time", pd.DataFrame()),
     "query_tool_calls": query_insights.get("tool_calls_distribution", pd.DataFrame()),
+    "query_latency_vs_input": query_insights.get("latency_vs_input", pd.DataFrame()),
     "session_chat_counts": query_insights.get("session_counts", pd.DataFrame()),
     "session_over_time": query_insights.get("session_over_time", pd.DataFrame()),
 }
