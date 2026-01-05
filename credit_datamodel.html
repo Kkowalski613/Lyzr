@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Credit Data Model</title>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f6f7fb;
+      --card: #ffffff;
+      --ink: #1f2933;
+      --muted: #5f6a7a;
+      --line: #c2c8d0;
+      --accent: #2563eb;
+      --shadow: 0 10px 40px rgba(17, 24, 39, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Manrope", "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+    }
+
+    .page {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 32px 20px 60px;
+    }
+
+    header h1 { margin: 0; font-size: 28px; letter-spacing: -0.02em; }
+    header p { margin: 8px 0 0; color: var(--muted); max-width: 900px; line-height: 1.6; }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 18px 0 12px;
+    }
+
+    button {
+      border: 1px solid #d7dce2;
+      background: #fff;
+      color: var(--ink);
+      padding: 9px 12px;
+      border-radius: 10px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      cursor: pointer;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
+      transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+    }
+
+    button:hover {
+      border-color: #a5b4c6;
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.07);
+    }
+
+    .diagram {
+      position: relative;
+      margin-top: 10px;
+      background: #eef1f7;
+      border: 1px solid #d9dde6;
+      border-radius: 18px;
+      padding: 24px;
+      min-height: 620px;
+      overflow: hidden;
+    }
+
+    #connections {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    .tables {
+      position: relative;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      z-index: 1;
+    }
+
+    .table-card {
+      background: var(--card);
+      border: 1px solid #dde2eb;
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 12px 14px;
+      position: relative;
+    }
+
+    .table-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 6px;
+    }
+
+    .table-title { margin: 0; font-size: 16px; font-weight: 700; }
+    .table-note { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
+
+    .fields { list-style: none; padding: 0; margin: 8px 0 0; }
+
+    .field {
+      border: 1px dashed #e5e7eb;
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      background: #fbfcff;
+      position: relative;
+    }
+
+    .field strong { display: block; font-size: 14px; }
+    .field small { display: block; color: var(--muted); margin-top: 4px; }
+
+    .field.supporting {
+      background: #f5f6fa;
+      color: var(--muted);
+    }
+
+    .field.hidden { display: none; }
+
+    .support-toggle {
+      color: var(--accent);
+      background: transparent;
+      border-color: transparent;
+      box-shadow: none;
+      padding: 6px 0;
+    }
+
+    .support-toggle:hover { transform: none; box-shadow: none; }
+
+    .connector-label {
+      fill: #7c8492;
+      font-size: 11px;
+      dominant-baseline: middle;
+    }
+
+    .connector-line {
+      stroke: var(--line);
+      stroke-width: 2;
+      stroke-linecap: round;
+    }
+
+    .legend {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 6px;
+    }
+
+    .legend .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--accent);
+      display: inline-block;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>Credit Data Model</h1>
+      <p>A simple, Power BI-style view. Each mini table shows plain-English fields; arrows connect the cells that feed the next step. We start with only the main fields visible so you can reveal supporting fields when you need them.</p>
+    </header>
+
+    <div class="controls">
+      <button id="show-main">Show only main fields</button>
+      <button id="show-all">Show supporting fields everywhere</button>
+    </div>
+
+    <div class="legend">
+      <span class="dot"></span> arrows show how one cell feeds another
+    </div>
+
+    <div class="diagram" id="diagram">
+      <svg id="connections" aria-hidden="true"></svg>
+      <div class="tables" id="tables"></div>
+    </div>
+  </div>
+
+  <script>
+    const tables = [
+      {
+        id: "raw",
+        title: "Uploaded usage rows",
+        note: "Raw CSV/Excel upload",
+        main: [
+          { id: "raw_email", label: "User email from upload", note: "As-is from the source file" },
+          { id: "raw_agent", label: "Agent id from upload", note: "Exact agent id string" },
+          { id: "raw_credits", label: "Credits column", note: "Taken from the actions column" },
+          { id: "raw_time", label: "Timestamp of call", note: "Original created_at value" },
+          { id: "raw_model", label: "Model name from upload", note: "As provided in the file" }
+        ],
+        supporting: [
+          { id: "raw_call_type", label: "Call type label", note: "Chat vs embedding tag" },
+          { id: "raw_latency", label: "Latency value", note: "Any latency column provided" }
+        ]
+      },
+      {
+        id: "clean",
+        title: "Cleaned usage rows",
+        note: "Normalized per call",
+        main: [
+          { id: "clean_email", label: "Clean email", note: "Lowercase, blanks become (no email)" },
+          { id: "clean_agent", label: "Clean agent id", note: "Lowercase, blanks become (unassigned)" },
+          { id: "clean_credits", label: "Credits as number", note: "Only positive values kept" },
+          { id: "clean_date", label: "Call date", note: "Date extracted from timestamp" },
+          { id: "clean_month", label: "Month start key", note: "Month used for trends" },
+          { id: "clean_model", label: "Model name normalized", note: "Standardized label" }
+        ],
+        supporting: [
+          { id: "clean_hour", label: "Hour bucket", note: "For burst detection" },
+          { id: "clean_call_type", label: "Call type flag", note: "Embedding vs chat" }
+        ]
+      },
+      {
+        id: "roles",
+        title: "Roles lookup (optional)",
+        note: "Workbook join on email",
+        main: [
+          { id: "role_email", label: "User email from roles workbook", note: "Match key" },
+          { id: "role_name", label: "Role name", note: "Title from lookup" },
+          { id: "role_office", label: "Office location", note: "Office from lookup" }
+        ],
+        supporting: [
+          { id: "role_team", label: "Discipline or team", note: "Discipline column when available" }
+        ]
+      },
+      {
+        id: "users",
+        title: "Users (grouped by email)",
+        note: "One row per user",
+        main: [
+          { id: "user_email", label: "User email (one row per user)", note: "Key for the user table" },
+          { id: "user_calls", label: "Calls count", note: "How many calls the user made" },
+          { id: "user_credits", label: "Total credits used", note: "Sum of credits for this user" },
+          { id: "user_credit_share", label: "Credit share of period", note: "User share of total credits" },
+          { id: "user_burst", label: "Burst flag", note: "Marks 10+ messages per hour" },
+          { id: "user_role", label: "Role and office", note: "Pulled from roles lookup when present" }
+        ],
+        supporting: [
+          { id: "user_agents", label: "Unique agents engaged", note: "Distinct agent ids per user" },
+          { id: "user_latency", label: "Average latency for user", note: "If latency exists in source" },
+          { id: "user_last_seen", label: "Last activity date", note: "Most recent call date" }
+        ]
+      },
+      {
+        id: "allotment",
+        title: "Credits & allotments",
+        note: "Period totals",
+        main: [
+          { id: "period_total_credits", label: "Total credits in selected period", note: "Sum of all user credits" },
+          { id: "active_users", label: "Active users count", note: "Unique users with activity" },
+          { id: "remaining_pool", label: "Remaining from 250k pool", note: "250k minus credits used" },
+          { id: "embedding_share", label: "Embedding share of credits", note: "Portion tagged as embeddings" },
+          { id: "monthly_avg", label: "Average monthly usage", note: "Average based on selected period" }
+        ],
+        supporting: [
+          { id: "annual_projection", label: "Projected annual usage", note: "Based on recent pace" }
+        ]
+      }
+    ];
+
+    const edges = [
+      { from: "raw_email", to: "clean_email", label: "clean email" },
+      { from: "raw_agent", to: "clean_agent", label: "clean agent id" },
+      { from: "raw_credits", to: "clean_credits", label: "parse credits" },
+      { from: "raw_time", to: "clean_date", label: "extract date" },
+      { from: "raw_time", to: "clean_month", label: "build month key" },
+      { from: "raw_model", to: "clean_model", label: "standardize model" },
+      { from: "raw_call_type", to: "clean_call_type", label: "keep call type" },
+      { from: "raw_latency", to: "user_latency", label: "average latency" },
+      { from: "clean_email", to: "role_email", label: "lookup key" },
+      { from: "role_name", to: "user_role", label: "add role" },
+      { from: "role_office", to: "user_role", label: "add office" },
+      { from: "role_team", to: "user_role", label: "add team" },
+      { from: "clean_email", to: "user_email", label: "group by user" },
+      { from: "clean_credits", to: "user_credits", label: "sum credits" },
+      { from: "clean_date", to: "user_calls", label: "count calls" },
+      { from: "clean_agent", to: "user_agents", label: "unique agents" },
+      { from: "clean_call_type", to: "embedding_share", label: "embedding tag" },
+      { from: "user_credits", to: "period_total_credits", label: "total credits" },
+      { from: "user_email", to: "active_users", label: "unique users" },
+      { from: "period_total_credits", to: "remaining_pool", label: "subtract from 250k" },
+      { from: "period_total_credits", to: "monthly_avg", label: "average per month" },
+      { from: "monthly_avg", to: "annual_projection", label: "project forward" },
+      { from: "user_credits", to: "user_credit_share", label: "percentage of total" },
+      { from: "user_calls", to: "user_burst", label: "burst detection" }
+    ];
+
+    const tablesContainer = document.getElementById("tables");
+    const svg = document.getElementById("connections");
+    const diagram = document.getElementById("diagram");
+    const expandedTables = new Set();
+    const fieldElements = new Map();
+
+    function buildTables() {
+      tablesContainer.innerHTML = "";
+      fieldElements.clear();
+
+      tables.forEach(table => {
+        const card = document.createElement("div");
+        card.className = "table-card";
+        card.dataset.id = table.id;
+
+        const header = document.createElement("div");
+        header.className = "table-header";
+        header.innerHTML = `
+          <div>
+            <p class="table-title">${table.title}</p>
+            <p class="table-note">${table.note}</p>
+          </div>
+          <button class="support-toggle" data-table="${table.id}">Show supporting fields</button>
+        `;
+
+        const list = document.createElement("ul");
+        list.className = "fields";
+
+        const addField = (field, supporting = false) => {
+          const li = document.createElement("li");
+          li.className = `field${supporting ? " supporting hidden" : ""}`;
+          li.dataset.fieldId = field.id;
+          li.innerHTML = `<strong>${field.label}</strong><small>${field.note}</small>`;
+          fieldElements.set(field.id, li);
+          list.appendChild(li);
+        };
+
+        table.main.forEach(f => addField(f, false));
+        (table.supporting || []).forEach(f => addField(f, true));
+
+        card.appendChild(header);
+        card.appendChild(list);
+        tablesContainer.appendChild(card);
+      });
+
+      attachSupportToggles();
+      applySupportVisibility();
+      ensureDefs();
+      drawConnections();
+    }
+
+    function attachSupportToggles() {
+      document.querySelectorAll(".support-toggle").forEach(btn => {
+        const id = btn.dataset.table;
+        const table = tables.find(t => t.id === id);
+        if (!table || !table.supporting || !table.supporting.length) {
+          btn.style.display = "none";
+          return;
+        }
+        btn.addEventListener("click", () => {
+          if (expandedTables.has(id)) expandedTables.delete(id);
+          else expandedTables.add(id);
+          applySupportVisibility();
+          drawConnections();
+        });
+      });
+    }
+
+    function applySupportVisibility() {
+      document.querySelectorAll(".table-card").forEach(card => {
+        const id = card.dataset.id;
+        const show = expandedTables.has(id);
+        card.querySelectorAll(".field.supporting").forEach(field => {
+          field.classList.toggle("hidden", !show);
+        });
+        const btn = card.querySelector(".support-toggle");
+        if (btn) btn.textContent = show ? "Hide supporting fields" : "Show supporting fields";
+      });
+    }
+
+    function ensureDefs() {
+      if (svg.querySelector("defs")) return;
+      const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+      const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+      marker.setAttribute("id", "arrowhead");
+      marker.setAttribute("markerWidth", "10");
+      marker.setAttribute("markerHeight", "10");
+      marker.setAttribute("refX", "8");
+      marker.setAttribute("refY", "5");
+      marker.setAttribute("orient", "auto");
+      marker.innerHTML = '<path d="M 0 0 L 10 5 L 0 10 z" fill="#c2c8d0"></path>';
+      defs.appendChild(marker);
+      svg.appendChild(defs);
+    }
+
+    function isVisible(el) {
+      return el && !el.classList.contains("hidden") && el.offsetParent !== null;
+    }
+
+    function drawConnections() {
+      const defs = svg.querySelector("defs");
+      svg.innerHTML = "";
+      if (defs) svg.appendChild(defs);
+
+      const rect = diagram.getBoundingClientRect();
+      svg.setAttribute("width", rect.width);
+      svg.setAttribute("height", rect.height);
+
+      edges.forEach(edge => {
+        const fromEl = fieldElements.get(edge.from);
+        const toEl = fieldElements.get(edge.to);
+        if (!isVisible(fromEl) || !isVisible(toEl)) return;
+
+        const fromRect = fromEl.getBoundingClientRect();
+        const toRect = toEl.getBoundingClientRect();
+
+        const x1 = fromRect.right - rect.left + 6;
+        const y1 = fromRect.top - rect.top + fromRect.height / 2;
+        const x2 = toRect.left - rect.left - 6;
+        const y2 = toRect.top - rect.top + toRect.height / 2;
+
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", x1);
+        line.setAttribute("y1", y1);
+        line.setAttribute("x2", x2);
+        line.setAttribute("y2", y2);
+        line.setAttribute("class", "connector-line");
+        line.setAttribute("marker-end", "url(#arrowhead)");
+        svg.appendChild(line);
+
+        if (edge.label) {
+          const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+          text.setAttribute("x", (x1 + x2) / 2);
+          text.setAttribute("y", (y1 + y2) / 2 - 6);
+          text.setAttribute("class", "connector-label");
+          text.textContent = edge.label;
+          svg.appendChild(text);
+        }
+      });
+    }
+
+    document.getElementById("show-main").addEventListener("click", () => {
+      expandedTables.clear();
+      applySupportVisibility();
+      drawConnections();
+    });
+
+    document.getElementById("show-all").addEventListener("click", () => {
+      tables.forEach(t => expandedTables.add(t.id));
+      applySupportVisibility();
+      drawConnections();
+    });
+
+    window.addEventListener("resize", drawConnections);
+    buildTables();
+  </script>
+</body>
+</html>

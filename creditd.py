@@ -1511,6 +1511,9 @@ mem_df = pd.DataFrame()
 agent_model_distribution_df = pd.DataFrame()
 agent_engagement_df = pd.DataFrame()
 daily_avg_agents_df = pd.DataFrame()
+latency_daily_activity_df = pd.DataFrame()
+latency_hourly_activity_df = pd.DataFrame()
+latency_weekly_activity_df = pd.DataFrame()
 
 if agents_available and not visible_enriched_df.empty:
     mapped_agents = visible_enriched_df[
@@ -1837,12 +1840,19 @@ with tab_latency:
     else:
         latency_df = latency_df.copy()
         latency_df["date"] = latency_df["created_at"].dt.date
+        latency_df["hour_window"] = latency_df["created_at"].dt.floor("H")
+        latency_df["week_start"] = latency_df["created_at"].dt.to_period("W-SUN").apply(lambda p: p.start_time)
+
+        active_user_count = lambda s: s[s != "(no email)"].nunique()
+
         daily_latency = (
             latency_df
-            .groupby("date")["latency_ms"]
+            .groupby("date")
             .agg(
-                avg_latency_ms="mean",
-                p95_latency_ms=lambda s: s.quantile(0.95),
+                active_users=("email", active_user_count),
+                avg_latency_ms=("latency_ms", "mean"),
+                p95_latency_ms=("latency_ms", lambda s: s.quantile(0.95)),
+                samples=("latency_ms", "count"),
             )
             .reset_index()
         )
@@ -1873,6 +1883,91 @@ with tab_latency:
             .properties(title="Latency over time", height=320)
         )
         st.altair_chart(latency_chart, use_container_width=True)
+
+        # Active users vs latency (daily/hourly/weekly)
+        hourly_latency = (
+            latency_df
+            .groupby("hour_window")
+            .agg(
+                active_users=("email", active_user_count),
+                avg_latency_ms=("latency_ms", "mean"),
+                p95_latency_ms=("latency_ms", lambda s: s.quantile(0.95)),
+                samples=("latency_ms", "count"),
+            )
+            .reset_index()
+            .sort_values("hour_window")
+        )
+        weekly_latency = (
+            latency_df
+            .groupby("week_start")
+            .agg(
+                active_users=("email", active_user_count),
+                avg_latency_ms=("latency_ms", "mean"),
+                p95_latency_ms=("latency_ms", lambda s: s.quantile(0.95)),
+                samples=("latency_ms", "count"),
+            )
+            .reset_index()
+            .sort_values("week_start")
+        )
+
+        latency_daily_activity_df = daily_latency.copy()
+        latency_hourly_activity_df = hourly_latency.copy()
+        latency_weekly_activity_df = weekly_latency.copy()
+
+        def render_activity_chart(df: pd.DataFrame, x_field: str, title: str):
+            if df.empty:
+                st.info(f"No {title.lower()} data available.")
+                return
+
+            bar = (
+                alt.Chart(df)
+                .mark_bar(color="#22c55e", opacity=0.3)
+                .encode(
+                    x=alt.X(f"{x_field}:T", title=title),
+                    y=alt.Y("active_users:Q", axis=alt.Axis(title="Active users")),
+                    tooltip=[
+                        alt.Tooltip(f"{x_field}:T", title=title),
+                        alt.Tooltip("active_users:Q", format=",", title="Active users"),
+                        alt.Tooltip("samples:Q", format=",", title="Samples"),
+                    ],
+                )
+            )
+
+            avg_line = (
+                alt.Chart(df)
+                .mark_line(point=True, color="#2563eb")
+                .encode(
+                    x=alt.X(f"{x_field}:T", title=title),
+                    y=alt.Y("avg_latency_ms:Q", axis=alt.Axis(title="Avg latency (ms)", titleColor="#2563eb")),
+                    tooltip=[
+                        alt.Tooltip(f"{x_field}:T", title=title),
+                        alt.Tooltip("avg_latency_ms:Q", format=",.0f", title="Avg latency (ms)"),
+                    ],
+                )
+            )
+
+            p95_line = (
+                alt.Chart(df)
+                .mark_line(point=True, color="#ef4444", strokeDash=[6, 3])
+                .encode(
+                    x=alt.X(f"{x_field}:T", title=title),
+                    y=alt.Y("p95_latency_ms:Q", axis=alt.Axis(title="P95 latency (ms)", titleColor="#ef4444")),
+                    tooltip=[
+                        alt.Tooltip(f"{x_field}:T", title=title),
+                        alt.Tooltip("p95_latency_ms:Q", format=",.0f", title="P95 latency (ms)"),
+                    ],
+                )
+            )
+
+            chart = (bar + avg_line + p95_line).resolve_scale(y="independent").properties(
+                height=320, title=f"Active users and latency by {title.lower()}"
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+        st.markdown("##### Active users and latency")
+        render_activity_chart(daily_latency.rename(columns={"date": "Date"}), "Date", "Day")
+        render_activity_chart(weekly_latency.rename(columns={"week_start": "Week"}), "Week", "Week")
+        render_activity_chart(hourly_latency.rename(columns={"hour_window": "Hour"}), "Hour", "Hour")
 
         st.markdown("##### Latency by model")
         latency_by_model = (
@@ -2695,6 +2790,9 @@ export_sheets = {
     "weekly_usage": weekly_usage_df,
     "avg_agents_per_user_daily": daily_avg_agents_df,
     "latency_daily": daily_latency_df,
+    "latency_daily_activity": latency_daily_activity_df,
+    "latency_hourly_activity": latency_hourly_activity_df,
+    "latency_weekly_activity": latency_weekly_activity_df,
     "latency_by_model": latency_by_model_df,
     "agent_latency": agent_latency_summary_df,
     "agent_latency_kb": kb_df,
